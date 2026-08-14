@@ -222,6 +222,45 @@ If you find _Pointcept_ useful to your research, please cite our work as encoura
   pip install open3d
   ```
 
+- **Method 4**: Build every native dependency yourself with `scripts/build_wheels.sh`. Use this when no
+  prebuilt wheel exists for your device, most notably on **aarch64** (GH200/GB200, Jetson Orin, Grace CPUs):
+  `spconv`, `cumm` and the PyG companions `torch-scatter`/`torch-sparse`/`torch-cluster` publish x86_64
+  wheels only, and `flash-attn` publishes an sdist only. The script decides per package whether a prebuilt
+  wheel exists for the requested target and compiles from source when it does not, so the same command
+  works on amd64 and arm64.
+
+  ```bash
+  # Inspect the matrix before spending nvcc time on it
+  ./scripts/build_wheels.sh matrix --preset default
+
+  # amd64 + arm64, CUDA 12.8, torch 2.9.1, CPython 3.12
+  ./scripts/build_wheels.sh build --preset default
+
+  # A single target, with the device code trimmed to one architecture
+  ./scripts/build_wheels.sh build --arch arm64 --accel cu128 --cuda-arch "9.0"
+
+  # AMD GPUs
+  ./scripts/build_wheels.sh build --arch amd64 --accel rocm6.4 --rocm-arch "gfx90a;gfx942"
+  ```
+
+  Docker is not required: the script probes `docker`, `podman` and `nerdctl` in that order and uses the
+  first one that actually answers, so a box with only Podman works with no extra flags. Pick one explicitly
+  with `--engine podman` (or `PC_ENGINE=podman`). Engine differences are handled for you — fully qualified
+  image names for Podman/nerdctl, SELinux relabeling on bind mounts, and output ownership that is correct
+  under both rootful and rootless engines. The one thing a rootless engine cannot do is register QEMU
+  binfmt handlers; `setup-qemu` detects that and prints the `sudo` / `qemu-user-static` alternatives.
+
+  Wheels land in `wheelhouse/linux-<arch>/<accel>/torch<ver>-cp<py>/`, each directory carrying a
+  `manifest.txt` that records whether a wheel was downloaded or compiled. Install them with
+  `pip install wheelhouse/linux-*/cu128/torch2.9.1-cp312/*.whl`, or fold them into a runnable image with
+  `./scripts/build_wheels.sh image --preset default`.
+
+  Cross-architecture builds run under QEMU after a one-time `./scripts/build_wheels.sh setup-qemu`.
+  QEMU-emulated `nvcc` is 10-30x slower than native, so for a full arm64 matrix point the script at a real
+  aarch64 machine instead: `--docker-host ssh://your-arm-box`. That runs entirely on the remote daemon, so
+  the remote host needs a checkout at the same path and the wheels are written to its own `wheelhouse/`,
+  ready to be copied back. Run `./scripts/build_wheels.sh help` for the full option list.
+
 ## Data Preparation
 
 ### ScanNet v2

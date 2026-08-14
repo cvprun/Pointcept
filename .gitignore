@@ -9,6 +9,7 @@ weights
 data
 *log*
 outputs/
+wheelhouse/
 .vscode
 .idea
 */.DS_Store
