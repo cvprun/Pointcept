@@ -403,6 +403,9 @@ ${C_BOLD}NOTES${C_RESET}
   * A --cuda-arch (or default) target the chosen nvcc cannot emit drops that
     combination during validation: CUDA 12.6 stops at sm_90, 12.8 adds sm_100
     and sm_120, sm_121 (DGX Spark) needs 12.9+, and sm_110 (Thor) needs 13.x.
+  * cumm and spconv accept a shorter arch list than nvcc does and reject the
+    rest outright, so Thor, Blackwell Ultra and DGX Spark targets are built as
+    the newest arch cumm knows plus PTX. Those kernels JIT on first load.
 EOF
 }
 
@@ -1478,10 +1481,69 @@ cumm_cuda_version() {
   esac
 }
 
+# cumm keeps its own table of acceptable targets (supported_arches in
+# cumm/common.py) and raises `Unknown CUDA arch (X) or GPU not supported` from
+# setup.py for anything outside it, so what nvcc can compile is not the last word
+# here. The table below is that list, and it knows nothing about Thor (11.0),
+# Blackwell Ultra (8.8 / 10.3) or GB10 (12.1) -- the parts this script targets
+# for arm64 CUDA 13.
+cumm_supported_arches() {
+  echo "3.5 3.7 5.0 5.2 5.3 6.0 6.1 6.2 7.0 7.2 7.5 8.0 8.6 8.7 8.9 9.0 10.0 12.0"
+}
+
+# Map one capability onto the closest thing cumm accepts: itself when the table
+# has it, and otherwise the newest entry below it, asked for as PTX so the driver
+# JIT compiles it for the real device on first load. A cubin cannot cross a
+# Blackwell family boundary, but PTX can, which is what makes sm_121 reachable
+# through 12.0+PTX. Fails only when every entry is newer than the target.
+cumm_arch_for() {
+  local want; want="$(normalize_arch "$1")"
+  local a best=""
+  for a in $(cumm_supported_arches); do
+    [[ "${a}" == "${want}" ]] && { echo "${a}"; return 0; }
+    version_ge "${want}" "${a}" && best="${a}"
+  done
+  [[ -n "${best}" ]] || return 1
+  echo "${best}+PTX"
+}
+
 # cumm/spconv take a semicolon-separated arch list, unlike torch's space form.
 cumm_arch_list() {
-  local archs="${TORCH_CUDA_ARCH_LIST:-}"
-  echo "${archs// /;}"
+  local -A want_ptx=()
+  local -a bases=()
+  local a mapped base
+  for a in ${TORCH_CUDA_ARCH_LIST:-}; do
+    if ! mapped="$(cumm_arch_for "${a}")"; then
+      c_warn "cumm/spconv have no arch at or below ${a}; dropped from their build"
+      continue
+    fi
+    base="${mapped%+PTX}"
+    [[ " ${bases[*]} " == *" ${base} "* ]] || bases+=("${base}")
+    # PTX whenever the mapping had to move, or the caller asked for it. Emitting
+    # both "12.0" and "12.0+PTX" would hand nvcc the same gencode twice.
+    [[ "${mapped}" == *+PTX || "${a}" == *+PTX ]] && want_ptx["${base}"]=1
+  done
+
+  local -a out=()
+  for base in "${bases[@]}"; do
+    if [[ -n "${want_ptx[${base}]:-}" ]]; then out+=("${base}+PTX"); else out+=("${base}"); fi
+  done
+  (IFS=';'; echo "${out[*]}")
+}
+
+# The list to build cumm and spconv with, or a skip when nothing in this target
+# survives the mapping. Announced like flash-attn's, because a source build that
+# quietly compiles for a different arch than asked for is worth seeing.
+cumm_arch_list_or_skip() {
+  local name="$1" archs
+  archs="$(cumm_arch_list)"
+  if [[ "${PC_ACCEL}" == cu* && -z "${archs}" ]]; then
+    c_warn "${name} skipped: nothing in '${TORCH_CUDA_ARCH_LIST:-}' maps onto an arch cumm accepts"
+    record "skipped   ${name} (no cumm-compatible arch in ${TORCH_CUDA_ARCH_LIST:-n/a})"
+    return 1
+  fi
+  [[ -n "${archs}" ]] && c_log "cumm arch set: ${archs} (from ${TORCH_CUDA_ARCH_LIST})"
+  echo "${archs}"
 }
 
 pkg_cumm() {
@@ -1494,9 +1556,11 @@ pkg_cumm() {
 
   if [[ "${PC_ARCH}" == "amd64" ]] && try_prebuilt "${variant}"; then return 0; fi
 
+  local archs; archs="$(cumm_arch_list_or_skip cumm)" || return 0
+
   build_wheel "cumm" "git+https://github.com/FindDefinition/cumm.git" \
     "CUMM_DISABLE_JIT=1" \
-    "CUMM_CUDA_ARCH_LIST=$(cumm_arch_list)" \
+    "CUMM_CUDA_ARCH_LIST=${archs}" \
     "CUMM_CUDA_VERSION=$(cumm_cuda_version)"
 }
 
@@ -1508,6 +1572,8 @@ pkg_spconv() {
 
   if [[ "${PC_ARCH}" == "amd64" ]] && try_prebuilt "${variant}"; then return 0; fi
 
+  local archs; archs="$(cumm_arch_list_or_skip spconv)" || return 0
+
   # A source build imports cumm at build time, so install the wheel produced by
   # pkg_cumm (or a released one) before invoking setup.py.
   if compgen -G "/out/cumm-*.whl" >/dev/null; then
@@ -1517,7 +1583,7 @@ pkg_spconv() {
 
   build_wheel "spconv" "git+https://github.com/traveller59/spconv.git" \
     "SPCONV_DISABLE_JIT=1" \
-    "CUMM_CUDA_ARCH_LIST=$(cumm_arch_list)" \
+    "CUMM_CUDA_ARCH_LIST=${archs}" \
     "CUMM_CUDA_VERSION=$(cumm_cuda_version)"
 }
 
