@@ -92,6 +92,10 @@ die()   { error "$*"; exit 1; }
 # base image, pip index and architecture flags needed for that target.
 # ==============================================================================
 
+# Every CUDA token this script knows, oldest first. Iterated when a capability
+# has to be traced back to the toolkits that can emit it.
+KNOWN_CUDA_ACCELS=(cu118 cu121 cu124 cu126 cu128 cu129 cu130 cu131 cu132)
+
 # Map a `cuXYZ` token onto a concrete `nvidia/cuda` devel tag. Only tags that
 # actually publish a linux/arm64 manifest are listed; keep this table in sync
 # with `docker manifest inspect nvidia/cuda:<tag>-devel-<os>`.
@@ -174,7 +178,7 @@ base_image_for() {
   case "${kind}" in
     cuda)
       local full; full="$(cuda_full_version "${accel}")" \
-        || die "unsupported CUDA token '${accel}' (known: cu118 cu121 cu124 cu126 cu128 cu129 cu130 cu131 cu132)"
+        || die "unsupported CUDA token '${accel}' (known: ${KNOWN_CUDA_ACCELS[*]})"
       echo "nvidia/cuda:${full}-devel-${os}"
       ;;
     rocm)
@@ -192,6 +196,65 @@ torch_index_url() {
   echo "https://download.pytorch.org/whl/$1"
 }
 
+# Every compute capability each toolkit's nvcc can emit code for, ascending.
+# Read off `nvcc --list-gpu-arch` for each release rather than inferred, because
+# neither end of the range moves predictably: Blackwell landed one family per
+# minor release (12.8 brought sm_100/sm_120, 12.9 added sm_103/sm_121, sm_110
+# only exists in 13.x), and CUDA 13 dropped Maxwell through Volta at the bottom.
+# There are holes too -- sm_101 exists in 12.8 and 12.9 but not in 13.x -- so
+# this is a membership test, not a floor-and-ceiling comparison.
+#
+# Asking nvcc for a target outside its list is a hard `nvcc fatal: Unsupported
+# gpu architecture 'compute_NNN'` on the first CUDA source file, which is why
+# both the defaults below and any --cuda-arch are checked against this.
+cuda_supported_arches() {
+  case "$1" in
+    cu118) echo "3.5 3.7 5.0 5.2 5.3 6.0 6.1 6.2 7.0 7.2 7.5 8.0 8.6 8.7 8.9 9.0" ;;
+    cu121|cu124|cu126)
+           echo "5.0 5.2 5.3 6.0 6.1 6.2 7.0 7.2 7.5 8.0 8.6 8.7 8.9 9.0" ;;
+    cu128) echo "5.0 5.2 5.3 6.0 6.1 6.2 7.0 7.2 7.5 8.0 8.6 8.7 8.9 9.0 10.0 10.1 12.0" ;;
+    cu129) echo "5.0 5.2 5.3 6.0 6.1 6.2 7.0 7.2 7.5 8.0 8.6 8.7 8.9 9.0 10.0 10.1 10.3 12.0 12.1" ;;
+    cu130|cu131|cu132)
+           echo "7.5 8.0 8.6 8.7 8.8 8.9 9.0 10.0 10.3 11.0 12.0 12.1" ;;
+    *)     return 1 ;;
+  esac
+}
+
+cuda_arch_floor()   { cuda_supported_arches "$1" | awk '{print $1}';  }
+cuda_arch_ceiling() { cuda_supported_arches "$1" | awk '{print $NF}'; }
+
+# TORCH_CUDA_ARCH_LIST entries carry decoration a capability comparison must
+# ignore: a trailing "+PTX", and the sm_90a / sm_100f family-variant suffixes.
+normalize_arch() {
+  local a="${1%%+*}"
+  echo "${a%%[a-z]}"
+}
+
+cuda_supports_arch() {
+  local list; list="$(cuda_supported_arches "$1")" || return 1
+  [[ " ${list} " == *" $(normalize_arch "$2") "* ]]
+}
+
+# Capabilities read as sm_ names when the message is about devices rather than
+# about the dotted form nvcc and TORCH_CUDA_ARCH_LIST take.
+arch_names() {
+  local cap
+  local -a out=()
+  for cap in "$@"; do out+=("sm_${cap//./}"); done
+  echo "${out[*]}"
+}
+
+# Which known toolkits can target this capability -- what to name when the
+# requested one cannot.
+cuda_accels_supporting() {
+  local cap="$1" accel
+  local -a out=()
+  for accel in "${KNOWN_CUDA_ACCELS[@]}"; do
+    cuda_supports_arch "${accel}" "${cap}" && out+=("${accel}")
+  done
+  echo "${out[*]}"
+}
+
 # Default device-code targets. Wrong values here are the most common cause of
 # "no kernel image is available for execution on the device" at runtime, so the
 # lists are deliberately explicit per architecture rather than using `all`.
@@ -200,12 +263,12 @@ torch_index_url() {
 #   arm64 : Jetson Orin (8.7), GH200 (9.0), GB200 (10.0), Thor (11.0),
 #           RTX Blackwell (12.0), DGX Spark / GB10 (12.1)
 #
-# CUDA 13 dropped Maxwell, Pascal and Volta, so sm_70 and below are trimmed
-# there. `nvcc --list-gpu-arch` for both 13.0 and 13.1 reports exactly:
-#   75 80 86 87 88 89 90 100 103 110 120 121
-# sm_110 (Thor) and sm_121 (GB10) are aarch64 parts and exist only from CUDA 13
-# onwards. Blackwell Ultra (8.8 / 10.3) is omitted from the defaults to keep
-# build times sane; pass --cuda-arch when targeting a B300/GB300.
+# Every list here has to be a subset of cuda_supported_arches for that toolkit,
+# which is what splits the arm64 CUDA 12 entries: 12.6 stops at sm_90, 12.8
+# reaches Blackwell but not GB10, and sm_121 needs 12.9 at the earliest. Only
+# CUDA 13 has Thor (sm_110). Blackwell Ultra (8.8 / 10.3) is omitted from the
+# defaults to keep build times sane; pass --cuda-arch when targeting a
+# B300/GB300.
 #
 # Note that Blackwell splits into family-specific architectures: an sm_120 cubin
 # does not load on an sm_121 device, so DGX Spark needs its own entry rather
@@ -215,7 +278,9 @@ default_cuda_arch_list() {
   if [[ "${arch}" == "arm64" ]]; then
     case "${accel}" in
       cu118|cu121|cu124) echo "7.2 8.7"                     ;;
-      cu126|cu128|cu129) echo "8.7 9.0 10.0 12.0"           ;;
+      cu126)             echo "8.7 9.0"                     ;;
+      cu128)             echo "8.7 9.0 10.0 12.0"           ;;
+      cu129)             echo "8.7 9.0 10.0 12.0 12.1"      ;;
       cu130|cu131|cu132) echo "8.7 9.0 10.0 11.0 12.0 12.1" ;;
       *)                 echo "8.7 9.0 10.0 11.0 12.0 12.1" ;;
     esac
@@ -332,6 +397,12 @@ ${C_BOLD}NOTES${C_RESET}
   * 'build' checks the host driver and GPU against each CUDA target and warns
     when the wheels would not load here. No GPU is needed to build them, so the
     check never blocks; it is there for when you are building for this machine.
+  * --preset local reads this machine's GPU and picks both the CUDA toolkit and
+    the arch list from it, so it builds the smallest set of wheels that runs
+    here. Any explicit --accel / --cuda-arch still wins.
+  * A --cuda-arch (or default) target the chosen nvcc cannot emit drops that
+    combination during validation: CUDA 12.6 stops at sm_90, 12.8 adds sm_100
+    and sm_120, sm_121 (DGX Spark) needs 12.9+, and sm_110 (Thor) needs 13.x.
 EOF
 }
 
@@ -407,8 +478,11 @@ apply_preset() {
       : "${ARCH_LIST:=amd64,arm64}"; : "${ACCEL_LIST:=cu126,cu128,cu130}"
       : "${TORCH_LIST:=2.8.0,2.9.1}"; : "${PYTHON_LIST:=3.11,3.12}"
       ;;
+    # cu130 is not optional coverage here: Thor (sm_110) and DGX Spark (sm_121)
+    # have no kernels at all in the CUDA 12 line, so without it the arm64 sweep
+    # skips two shipping aarch64 parts.
     arm64)
-      : "${ARCH_LIST:=arm64}"; : "${ACCEL_LIST:=cu126,cu128}"
+      : "${ARCH_LIST:=arm64}"; : "${ACCEL_LIST:=cu126,cu128,cu130}"
       : "${TORCH_LIST:=${DEFAULT_TORCH}}"; : "${PYTHON_LIST:=${DEFAULT_PYTHON}}"
       ;;
     ci)
@@ -416,9 +490,16 @@ apply_preset() {
       : "${TORCH_LIST:=${DEFAULT_TORCH}}"; : "${PYTHON_LIST:=${DEFAULT_PYTHON}}"
       : "${ONLY:=pointops,pointops2,pointgroup_ops,pointseg,pointrope}"
       ;;
+    # "local" means wheels that load on this machine, so the toolkit and the arch
+    # list follow the GPU that is actually in it rather than a fixed default --
+    # otherwise a host whose part the default cannot reach (a DGX Spark, say)
+    # builds a full set of wheels it cannot run. Both fall back to the usual
+    # defaults on a host with no NVIDIA driver.
     local)
-      : "${ARCH_LIST:=$(host_arch)}"; : "${ACCEL_LIST:=cu128}"
+      : "${ARCH_LIST:=$(host_arch)}"
       : "${TORCH_LIST:=${DEFAULT_TORCH}}"; : "${PYTHON_LIST:=${DEFAULT_PYTHON}}"
+      : "${ACCEL_LIST:=$(accel_for_host_gpu cu128 "${TORCH_LIST%%,*}")}"
+      : "${CUDA_ARCH_OVERRIDE:=$(host_gpu_caps || true)}"
       : "${ONLY:=pointops,pointops2,pointgroup_ops,pointseg,pointrope}"
       ;;
     *) die "unknown preset '${PRESET}' (default|full|arm64|ci|local)" ;;
@@ -502,6 +583,45 @@ expand_matrix() {
 }
 
 declare -A WARNED_INDEX_SUB=()
+declare -A ARCH_LIST_VERDICT=()
+
+# The effective TORCH_CUDA_ARCH_LIST has to be something this toolkit's nvcc
+# accepts. Checking it here costs nothing; discovering it from nvcc costs the
+# whole image pull, the torch install and the first CUDA source file. The
+# verdict is cached per accel/arch because validate_combo runs once per point of
+# the cartesian product and the answer does not depend on torch or python.
+validate_cuda_arch_list() {
+  local accel="$1" arch="$2"
+  local key="${accel}|${arch}"
+  [[ -n "${ARCH_LIST_VERDICT[${key}]:-}" ]] && return "${ARCH_LIST_VERDICT[${key}]}"
+
+  # An accelerator with no entry in the table is not one to guess about.
+  cuda_supported_arches "${accel}" >/dev/null || return 0
+
+  local want source
+  if [[ -n "${CUDA_ARCH_OVERRIDE}" ]]; then
+    want="${CUDA_ARCH_OVERRIDE}"; source="--cuda-arch"
+  else
+    want="$(default_cuda_arch_list "${accel}" "${arch}")"; source="default ${arch} arch list"
+  fi
+
+  local a
+  local -a bad=()
+  for a in ${want}; do
+    cuda_supports_arch "${accel}" "${a}" || bad+=("${a}")
+  done
+
+  if [[ ${#bad[@]} -gt 0 ]]; then
+    ARCH_LIST_VERDICT["${key}"]=1
+    local alt; alt="$(cuda_accels_supporting "${bad[0]}")"
+    warn "skip: nvcc $(cuda_full_version "${accel}") cannot target $(arch_names "${bad[@]}"), asked for by the ${source} '${want}'"
+    warn "  ${accel} spans $(arch_names "$(cuda_arch_floor "${accel}")") to $(arch_names "$(cuda_arch_ceiling "${accel}")"); $(arch_names "${bad[0]}") needs ${alt:-a toolkit this script does not know}"
+    return 1
+  fi
+
+  ARCH_LIST_VERDICT["${key}"]=0
+  return 0
+}
 
 validate_combo() {
   local os="$1" arch="$2" accel="$3" torch="$4" python="$5"
@@ -554,6 +674,7 @@ validate_combo() {
       warn "skip: torch ${torch} predates $(torch_index_accel "${accel}") wheels (needs >= ${min_torch})"
       return 1
     fi
+    validate_cuda_arch_list "${accel}" "${arch}" || return 1
   fi
 
   return 0
@@ -841,18 +962,6 @@ cuda_driver_floor() {
   esac
 }
 
-# Oldest compute capability each CUDA major can still emit code for. CUDA 13
-# dropped Maxwell, Pascal and Volta, which is what makes an old card and a new
-# toolkit an unfixable pairing rather than a missing --cuda-arch entry.
-cuda_arch_floor() {
-  case "$1" in
-    11) echo "3.5" ;;
-    12) echo "5.0" ;;
-    13) echo "7.5" ;;
-    *)  echo ""    ;;
-  esac
-}
-
 # One "driver,cap" line per GPU. compute_cap needs a reasonably recent
 # nvidia-smi, so fall back to the driver alone when the field is rejected.
 host_gpu_info() {
@@ -860,6 +969,57 @@ host_gpu_info() {
   nvidia-smi --query-gpu=driver_version,compute_cap --format=csv,noheader 2>/dev/null \
     || nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null \
     || return 1
+}
+
+# The distinct compute capabilities in this machine, in nvidia-smi order. Fails
+# rather than echoing nothing when there is no driver, or when nvidia-smi is too
+# old for the compute_cap field: an empty arch list and an unknown one need
+# different handling by the callers.
+host_gpu_caps() {
+  local info; info="$(host_gpu_info)" || return 1
+  local line cap
+  local -a caps=()
+  while IFS= read -r line; do
+    # Only the two-field form carries a capability; the driver-only fallback has
+    # no comma, and `cut` would hand back the driver version as if it were one.
+    [[ "${line}" == *,* ]] || continue
+    cap="$(echo "${line}" | cut -d',' -f2 | tr -d ' ')"
+    [[ "${cap}" =~ ^[0-9]+\.[0-9]+$ ]] || continue
+    [[ " ${caps[*]} " == *" ${cap} "* ]] || caps+=("${cap}")
+  done <<< "${info}"
+  [[ ${#caps[@]} -gt 0 ]] || return 1
+  echo "${caps[*]}"
+}
+
+accel_covers_caps() {
+  local accel="$1" cap
+  for cap in $2; do
+    cuda_supports_arch "${accel}" "${cap}" || return 1
+  done
+}
+
+# Which toolkit --preset local should build with. The preset's own default wins
+# whenever it can emit code for every GPU here, so the common case keeps the
+# toolkit it always used; only a part that default cannot reach moves the choice,
+# and then to the newest toolkit that covers it, because the newest CUDA line is
+# the one torch builds wheels for such a part against. Candidates are limited to
+# tokens with a PyTorch index of their own and wheels for this torch version.
+accel_for_host_gpu() {
+  local fallback="$1" torch="$2"
+  local caps; caps="$(host_gpu_caps)" || { echo "${fallback}"; return 0; }
+  accel_covers_caps "${fallback}" "${caps}" && { echo "${fallback}"; return 0; }
+
+  local i accel min_torch
+  for (( i = ${#KNOWN_CUDA_ACCELS[@]} - 1; i >= 0; i-- )); do
+    accel="${KNOWN_CUDA_ACCELS[i]}"
+    [[ "$(torch_index_accel "${accel}")" == "${accel}" ]] || continue
+    min_torch="$(cuda_min_torch "${accel}")"
+    [[ -n "${min_torch}" ]] && version_ge "${torch}" "${min_torch}" || continue
+    accel_covers_caps "${accel}" "${caps}" && { echo "${accel}"; return 0; }
+  done
+
+  # Nothing this script knows fits; the preflight warning below says why.
+  echo "${fallback}"
 }
 
 declare -A PREFLIGHT_DONE=()
@@ -897,41 +1057,48 @@ preflight_host_cuda() {
   # wheels are for the host's own CPU architecture.
   [[ "${arch}" == "$(host_arch)" ]] || return 0
 
+  local caps; caps="$(host_gpu_caps)" || {
+    debug "nvidia-smi reports no compute_cap; skipping the ${accel} arch check"
+    return 0
+  }
+
   local want; want="${CUDA_ARCH_OVERRIDE:-$(default_cuda_arch_list "${accel}" "${arch}")}"
-  local -a uncovered=()
-  local line cap
-  while IFS= read -r line; do
-    # Only the two-field form carries a capability; the driver-only fallback has
-    # no comma, and `cut` would hand back the driver version as if it were one.
-    [[ "${line}" == *,* ]] || continue
-    cap="$(echo "${line}" | cut -d',' -f2 | tr -d ' ')"
-    [[ "${cap}" =~ ^[0-9]+\.[0-9]+$ ]] || continue
-    [[ " ${want} " == *" ${cap} "* ]] && continue
-    [[ " ${uncovered[*]} " == *" ${cap} "* ]] || uncovered+=("${cap}")
-  done <<< "${info}"
+
+  # Compare capabilities, not list entries: "12.0+PTX" covers an sm_120 device.
+  local a cap
+  local -a want_caps=() uncovered=()
+  for a in ${want}; do want_caps+=("$(normalize_arch "${a}")"); done
+  for cap in ${caps}; do
+    [[ " ${want_caps[*]} " == *" ${cap} "* ]] || uncovered+=("${cap}")
+  done
 
   [[ ${#uncovered[@]} -gt 0 ]] || return 0
 
-  # Split the uncovered set: capabilities this toolkit could still target are a
-  # --cuda-arch away, the rest are simply too old for it.
-  local arch_floor; arch_floor="$(cuda_arch_floor "${major}")"
-  local -a addable=() obsolete=()
+  # Split the uncovered set three ways. Only capabilities this toolkit can emit
+  # are a --cuda-arch away; the rest sit outside its range, and suggesting a flag
+  # for those would send you into an `Unsupported gpu architecture` failure.
+  local -a addable=() too_new=() too_old=()
   for cap in "${uncovered[@]}"; do
-    if [[ -n "${arch_floor}" ]] && ! version_ge "${cap}" "${arch_floor}"; then
-      obsolete+=("sm_${cap//./}")
-    else
+    if cuda_supports_arch "${accel}" "${cap}"; then
       addable+=("${cap}")
+    elif version_ge "${cap}" "$(cuda_arch_ceiling "${accel}")"; then
+      too_new+=("${cap}")
+    else
+      too_old+=("${cap}")
     fi
   done
 
   if [[ ${#addable[@]} -gt 0 ]]; then
-    local -a names=()
-    for cap in "${addable[@]}"; do names+=("sm_${cap//./}"); done
-    warn "this host's GPU (${names[*]}) is not in the ${accel} arch list '${want}'"
+    warn "this host's GPU ($(arch_names "${addable[@]}")) is not in the ${accel} arch list '${want}'"
     warn "  pass --cuda-arch \"${addable[*]}\" to get kernels that run here"
   fi
-  if [[ ${#obsolete[@]} -gt 0 ]]; then
-    warn "this host's GPU (${obsolete[*]}) predates CUDA ${major}.x, which starts at sm_${arch_floor//./}"
+  if [[ ${#too_new[@]} -gt 0 ]]; then
+    local alt; alt="$(cuda_accels_supporting "${too_new[0]}")"
+    warn "this host's GPU ($(arch_names "${too_new[@]}")) is newer than CUDA ${full} can target, which tops out at $(arch_names "$(cuda_arch_ceiling "${accel}")")"
+    warn "  --cuda-arch cannot reach it: build with ${alt:-a newer toolkit} instead"
+  fi
+  if [[ ${#too_old[@]} -gt 0 ]]; then
+    warn "this host's GPU ($(arch_names "${too_old[@]}")) predates CUDA ${major}.x, which starts at $(arch_names "$(cuda_arch_floor "${accel}")")"
     warn "  build against an older toolkit for this machine"
   fi
 }
