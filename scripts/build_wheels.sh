@@ -103,9 +103,52 @@ cuda_full_version() {
     cu126) echo "12.6.3"  ;;
     cu128) echo "12.8.1"  ;;
     cu129) echo "12.9.1"  ;;
-    cu130) echo "13.0.1"  ;;
+    cu130) echo "13.0.3"  ;;
+    cu131) echo "13.1.2"  ;;
+    cu132) echo "13.2.1"  ;;
     *)     return 1       ;;
   esac
+}
+
+# PyTorch does not publish a wheel index for every CUDA minor release: the 13.x
+# line goes cu130 -> cu132 with no cu131 at all. A toolkit without an index is
+# still worth targeting -- CUDA guarantees minor version compatibility inside a
+# major release, so nvcc 13.1 compiles extensions that load against the CUDA
+# 13.0 runtime the torch wheel bundles. The toolkit token and the wheel index
+# are therefore resolved separately, and this maps one onto the other.
+torch_index_accel() {
+  case "$1" in
+    cu131) echo "cu130" ;;
+    *)     echo "$1"    ;;
+  esac
+}
+
+# The first torch release carrying wheels for each toolkit. An older torch has
+# no entry in that index at all (cu130 starts at 2.9.0), so the pairing is
+# dropped during validation rather than dying an hour later at install time.
+cuda_min_torch() {
+  case "$(torch_index_accel "$1")" in
+    cu126) echo "2.6.0"  ;;
+    cu128) echo "2.7.0"  ;;
+    cu129) echo "2.8.0"  ;;
+    cu130) echo "2.9.0"  ;;
+    cu132) echo "2.12.0" ;;
+    *)     echo ""       ;;
+  esac
+}
+
+# `sort -V` only orders two versions correctly when they have the same number of
+# components: it puts "2.9" before "2.9.0", which PEP 440 considers equal.
+pad_version() {
+  local v="$1" dots="${1//[^.]/}"
+  while [[ "${#dots}" -lt 2 ]]; do v="${v}.0"; dots="${dots}."; done
+  echo "${v}"
+}
+
+version_ge() {
+  local a b; a="$(pad_version "$1")"; b="$(pad_version "$2")"
+  [[ "${a}" == "${b}" ]] && return 0
+  [[ "$(printf '%s\n%s\n' "${a}" "${b}" | sort -V | head -1)" == "${b}" ]]
 }
 
 # CUDA releases before 12.6 never shipped an ubuntu24.04 devel image.
@@ -131,7 +174,7 @@ base_image_for() {
   case "${kind}" in
     cuda)
       local full; full="$(cuda_full_version "${accel}")" \
-        || die "unsupported CUDA token '${accel}' (known: cu118 cu121 cu124 cu126 cu128 cu129 cu130)"
+        || die "unsupported CUDA token '${accel}' (known: cu118 cu121 cu124 cu126 cu128 cu129 cu130 cu131 cu132)"
       echo "nvidia/cuda:${full}-devel-${os}"
       ;;
     rocm)
@@ -154,16 +197,27 @@ torch_index_url() {
 # lists are deliberately explicit per architecture rather than using `all`.
 #
 #   amd64 : datacenter + workstation NVIDIA parts
-#   arm64 : Jetson Orin (8.7), GH200 (9.0), GB200 (10.0), RTX Blackwell (12.0)
+#   arm64 : Jetson Orin (8.7), GH200 (9.0), GB200 (10.0), Thor (11.0),
+#           RTX Blackwell (12.0), DGX Spark / GB10 (12.1)
 #
-# CUDA 13 dropped every target below sm_75, so those entries are trimmed.
+# CUDA 13 dropped Maxwell, Pascal and Volta, so sm_70 and below are trimmed
+# there. `nvcc --list-gpu-arch` for both 13.0 and 13.1 reports exactly:
+#   75 80 86 87 88 89 90 100 103 110 120 121
+# sm_110 (Thor) and sm_121 (GB10) are aarch64 parts and exist only from CUDA 13
+# onwards. Blackwell Ultra (8.8 / 10.3) is omitted from the defaults to keep
+# build times sane; pass --cuda-arch when targeting a B300/GB300.
+#
+# Note that Blackwell splits into family-specific architectures: an sm_120 cubin
+# does not load on an sm_121 device, so DGX Spark needs its own entry rather
+# than riding on 12.0.
 default_cuda_arch_list() {
   local accel="$1" arch="$2"
   if [[ "${arch}" == "arm64" ]]; then
     case "${accel}" in
-      cu118|cu121|cu124) echo "7.2 8.7"                ;;
-      cu126|cu128|cu129) echo "8.7 9.0 10.0 12.0"      ;;
-      *)                 echo "8.7 9.0 10.0 11.0 12.0" ;;
+      cu118|cu121|cu124) echo "7.2 8.7"                     ;;
+      cu126|cu128|cu129) echo "8.7 9.0 10.0 12.0"           ;;
+      cu130|cu131|cu132) echo "8.7 9.0 10.0 11.0 12.0 12.1" ;;
+      *)                 echo "8.7 9.0 10.0 11.0 12.0 12.1" ;;
     esac
   else
     case "${accel}" in
@@ -171,6 +225,7 @@ default_cuda_arch_list() {
       cu121|cu124)       echo "7.0 7.5 8.0 8.6 8.9 9.0"     ;;
       cu126)             echo "7.0 7.5 8.0 8.6 8.9 9.0"     ;;
       cu128|cu129)       echo "7.5 8.0 8.6 8.9 9.0 10.0 12.0" ;;
+      cu130|cu131|cu132) echo "7.5 8.0 8.6 8.9 9.0 10.0 12.0" ;;
       *)                 echo "7.5 8.0 8.6 8.9 9.0 10.0 12.0" ;;
     esac
   fi
@@ -208,8 +263,9 @@ ${C_BOLD}COMMANDS${C_RESET}
 ${C_BOLD}MATRIX AXES${C_RESET} (comma separated; the cartesian product is built)
   --os        LIST   ubuntu24.04, ubuntu22.04            [${DEFAULT_OS}]
   --arch      LIST   amd64, arm64                        [${DEFAULT_ARCH}]
-  --accel     LIST   cu118 cu121 cu124 cu126 cu128
-                     cu129 cu130 rocm6.3 rocm6.4 cpu     [${DEFAULT_ACCEL}]
+  --accel     LIST   cu118 cu121 cu124 cu126 cu128 cu129
+                     cu130 cu131 cu132 rocm6.3 rocm6.4
+                     cpu                                 [${DEFAULT_ACCEL}]
   --torch     LIST   PyTorch versions, e.g. 2.8.0,2.9.1   [${DEFAULT_TORCH}]
   --python    LIST   CPython versions, e.g. 3.11,3.12     [${DEFAULT_PYTHON}]
   --preset    NAME   default | full | arm64 | ci | local
@@ -223,6 +279,8 @@ ${C_BOLD}PACKAGE SELECTION${C_RESET}
 
 ${C_BOLD}BUILD TUNING${C_RESET}
   --cuda-arch LIST   Override TORCH_CUDA_ARCH_LIST, e.g. "8.9 9.0"
+                     (also narrows flash-attn, which otherwise builds
+                      sm_80/90/100/120 every time)
   --rocm-arch LIST   Override PYTORCH_ROCM_ARCH, e.g. "gfx90a;gfx942"
   --jobs      N      Parallel compile jobs (MAX_JOBS)      [nproc, capped at 16]
   --out       DIR    Output directory                              [wheelhouse]
@@ -271,6 +329,9 @@ ${C_BOLD}NOTES${C_RESET}
     Output ownership is handled automatically either way.
   * Wheels land in <out>/linux-<arch>/<accel>/torch<ver>-cp<py>/ with a
     manifest.txt recording how each wheel was obtained.
+  * 'build' checks the host driver and GPU against each CUDA target and warns
+    when the wheels would not load here. No GPU is needed to build them, so the
+    check never blocks; it is there for when you are building for this machine.
 EOF
 }
 
@@ -440,6 +501,8 @@ expand_matrix() {
   done
 }
 
+declare -A WARNED_INDEX_SUB=()
+
 validate_combo() {
   local os="$1" arch="$2" accel="$3" torch="$4" python="$5"
   local kind
@@ -454,6 +517,13 @@ validate_combo() {
     if [[ " $(cuda_supported_os "${accel}") " != *" ${os} "* ]]; then
       warn "skip: ${accel} has no ${os} devel image (use $(cuda_supported_os "${accel}" | awk '{print $1}'))"
       return 1
+    fi
+    # Said once per accelerator, not once per combination: validate_combo runs
+    # for every point of the cartesian product.
+    local widx; widx="$(torch_index_accel "${accel}")"
+    if [[ "${widx}" != "${accel}" && -z "${WARNED_INDEX_SUB[${accel}]:-}" ]]; then
+      WARNED_INDEX_SUB["${accel}"]=1
+      warn "${accel}: PyTorch publishes no ${accel} wheels; torch comes from ${widx} (nvcc stays ${accel})"
     fi
   fi
 
@@ -477,6 +547,14 @@ validate_combo() {
     || { warn "skip: malformed torch version '${torch}'"; return 1; }
   [[ "${python}" =~ ^3\.[0-9]+$ ]] \
     || { warn "skip: malformed python version '${python}'"; return 1; }
+
+  if [[ "${kind}" == "cuda" ]]; then
+    local min_torch; min_torch="$(cuda_min_torch "${accel}")"
+    if [[ -n "${min_torch}" ]] && ! version_ge "${torch}" "${min_torch}"; then
+      warn "skip: torch ${torch} predates $(torch_index_accel "${accel}") wheels (needs >= ${min_torch})"
+      return 1
+    fi
+  fi
 
   return 0
 }
@@ -695,7 +773,8 @@ engine_run_args() {
   args+=(-e "PC_TORCH=${torch}" -e "PC_PYTHON=${python}")
   args+=(-e "PC_FORCE_SOURCE=${FORCE_SOURCE}" -e "PC_VERBOSE=${VERBOSE}")
   args+=(-e "PC_JOBS=${JOBS:-$(default_jobs)}")
-  args+=(-e "PC_TORCH_INDEX=$(torch_index_url "${accel}")")
+  args+=(-e "PC_TORCH_ACCEL=$(torch_index_accel "${accel}")")
+  args+=(-e "PC_TORCH_INDEX=$(torch_index_url "$(torch_index_accel "${accel}")")")
 
   # Under a rootful engine the build runs as real root, so the wheels must be
   # handed back to the invoking user. Under a rootless engine container root is
@@ -740,6 +819,123 @@ default_jobs() {
   echo "${n}"
 }
 
+# ==============================================================================
+# Host preflight
+#
+# The build never touches the host GPU: it runs in a container, nvcc cross
+# compiles, and FORCE_CUDA makes the extensions emit device code with no device
+# present. A host with no NVIDIA driver at all builds these wheels perfectly
+# well. So none of this gates the build -- it exists for the common case where
+# you are building for the machine you are sitting at, and answers whether the
+# result would actually load on it.
+# ==============================================================================
+
+# Driver floor per CUDA major, from "CUDA Toolkit and Minimum Required Driver
+# Version for CUDA Minor Version Compatibility" in the toolkit release notes.
+cuda_driver_floor() {
+  case "$1" in
+    11) echo "450" ;;
+    12) echo "525" ;;
+    13) echo "580" ;;
+    *)  echo ""    ;;
+  esac
+}
+
+# Oldest compute capability each CUDA major can still emit code for. CUDA 13
+# dropped Maxwell, Pascal and Volta, which is what makes an old card and a new
+# toolkit an unfixable pairing rather than a missing --cuda-arch entry.
+cuda_arch_floor() {
+  case "$1" in
+    11) echo "3.5" ;;
+    12) echo "5.0" ;;
+    13) echo "7.5" ;;
+    *)  echo ""    ;;
+  esac
+}
+
+# One "driver,cap" line per GPU. compute_cap needs a reasonably recent
+# nvidia-smi, so fall back to the driver alone when the field is rejected.
+host_gpu_info() {
+  command -v nvidia-smi >/dev/null 2>&1 || return 1
+  nvidia-smi --query-gpu=driver_version,compute_cap --format=csv,noheader 2>/dev/null \
+    || nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null \
+    || return 1
+}
+
+declare -A PREFLIGHT_DONE=()
+
+preflight_host_cuda() {
+  local accel="$1" arch="$2"
+  [[ "$(accel_kind "${accel}")" == "cuda" ]] || return 0
+
+  # The answer only depends on the toolkit and the target architecture, so say
+  # it once rather than once per torch/python combination.
+  local key="${accel}|${arch}"
+  [[ -n "${PREFLIGHT_DONE[${key}]:-}" ]] && return 0
+  PREFLIGHT_DONE["${key}"]=1
+
+  local info
+  if ! info="$(host_gpu_info)" || [[ -z "${info}" ]]; then
+    debug "no NVIDIA driver on this host; skipping the ${accel} runtime check"
+    return 0
+  fi
+
+  local full major driver floor
+  full="$(cuda_full_version "${accel}")"
+  major="${full%%.*}"
+  driver="$(echo "${info}" | head -1 | cut -d',' -f1 | tr -d ' ')"
+  floor="$(cuda_driver_floor "${major}")"
+
+  if [[ -n "${floor}" ]] && ! version_ge "${driver%%.*}" "${floor}"; then
+    warn "host driver ${driver} predates the ${floor}+ that CUDA ${major}.x requires"
+    warn "  the wheels still build, they just will not load on this host"
+  else
+    debug "host driver ${driver} satisfies CUDA ${major}.x (needs ${floor:-?}+)"
+  fi
+
+  # Comparing device code against the host GPU only means something when the
+  # wheels are for the host's own CPU architecture.
+  [[ "${arch}" == "$(host_arch)" ]] || return 0
+
+  local want; want="${CUDA_ARCH_OVERRIDE:-$(default_cuda_arch_list "${accel}" "${arch}")}"
+  local -a uncovered=()
+  local line cap
+  while IFS= read -r line; do
+    # Only the two-field form carries a capability; the driver-only fallback has
+    # no comma, and `cut` would hand back the driver version as if it were one.
+    [[ "${line}" == *,* ]] || continue
+    cap="$(echo "${line}" | cut -d',' -f2 | tr -d ' ')"
+    [[ "${cap}" =~ ^[0-9]+\.[0-9]+$ ]] || continue
+    [[ " ${want} " == *" ${cap} "* ]] && continue
+    [[ " ${uncovered[*]} " == *" ${cap} "* ]] || uncovered+=("${cap}")
+  done <<< "${info}"
+
+  [[ ${#uncovered[@]} -gt 0 ]] || return 0
+
+  # Split the uncovered set: capabilities this toolkit could still target are a
+  # --cuda-arch away, the rest are simply too old for it.
+  local arch_floor; arch_floor="$(cuda_arch_floor "${major}")"
+  local -a addable=() obsolete=()
+  for cap in "${uncovered[@]}"; do
+    if [[ -n "${arch_floor}" ]] && ! version_ge "${cap}" "${arch_floor}"; then
+      obsolete+=("sm_${cap//./}")
+    else
+      addable+=("${cap}")
+    fi
+  done
+
+  if [[ ${#addable[@]} -gt 0 ]]; then
+    local -a names=()
+    for cap in "${addable[@]}"; do names+=("sm_${cap//./}"); done
+    warn "this host's GPU (${names[*]}) is not in the ${accel} arch list '${want}'"
+    warn "  pass --cuda-arch \"${addable[*]}\" to get kernels that run here"
+  fi
+  if [[ ${#obsolete[@]} -gt 0 ]]; then
+    warn "this host's GPU (${obsolete[*]}) predates CUDA ${major}.x, which starts at sm_${arch_floor//./}"
+    warn "  build against an older toolkit for this machine"
+  fi
+}
+
 cmd_build() {
   require_engine
   local combos; combos="$(expand_matrix)"
@@ -764,6 +960,8 @@ cmd_build() {
     local tag; tag="linux-${arch}/${accel}/torch${torch}-cp${python}"
     echo
     echo "${C_BOLD}${C_BLUE}=== [${index}/${total}] ${tag} ===${C_RESET}" >&2
+
+    preflight_host_cuda "${accel}" "${arch}"
 
     if ! qemu_available_for "${arch}" && [[ -z "${DOCKER_HOST_OVERRIDE}" ]]; then
       warn "linux/${arch} requires QEMU which is not registered"
@@ -889,7 +1087,7 @@ COPY *.whl /wheels/
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh \\
  && /root/.local/bin/uv venv --python ${python} /opt/venv \\
  && /root/.local/bin/uv pip install --python /opt/venv/bin/python \\
-      --index-url $(torch_index_url "${accel}") \\
+      --index-url $(torch_index_url "$(torch_index_accel "${accel}")") \\
       torch==${torch} torchvision \\
  && /root/.local/bin/uv pip install --python /opt/venv/bin/python /wheels/*.whl \\
  && /root/.local/bin/uv pip install --python /opt/venv/bin/python \\
@@ -988,6 +1186,10 @@ container_install_torch() {
   cuda_ver="$(${PY} -c 'import torch; print(torch.version.cuda or torch.version.hip or "cpu")')"
   c_ok "torch ${torch_ver} (device runtime: ${cuda_ver})"
   record "# torch=${torch_ver} accel=${PC_ACCEL} arch=${PC_ARCH} python=${PC_PYTHON}"
+  if [[ -n "${PC_TORCH_ACCEL:-}" && "${PC_TORCH_ACCEL}" != "${PC_ACCEL}" ]]; then
+    c_warn "torch was built for ${PC_TORCH_ACCEL} (runtime ${cuda_ver}) but nvcc here is ${PC_ACCEL}"
+    record "# NOTE: compiled with the ${PC_ACCEL} toolkit against a ${PC_TORCH_ACCEL} torch"
+  fi
 }
 
 # Try to fetch a prebuilt wheel for the current interpreter/platform. Returns 0
@@ -1075,8 +1277,10 @@ build_wheel() {
 }
 
 pyg_find_links() {
-  # PyG publishes per-(torch, cuda) wheel indices, x86_64/win only.
-  local t="${PC_TORCH}" a="${PC_ACCEL}"
+  # PyG publishes per-(torch, cuda) wheel indices, x86_64/win only. The index is
+  # keyed by the torch build's CUDA version, which is not always the toolkit in
+  # this container (see torch_index_accel).
+  local t="${PC_TORCH}" a="${PC_TORCH_ACCEL:-${PC_ACCEL}}"
   [[ "${a}" == cu* ]] || { echo ""; return; }
   echo "https://data.pyg.org/whl/torch-${t}+${a}.html"
 }
@@ -1177,16 +1381,58 @@ pkg_torch_geometric() {
   build_wheel "torch-geometric" "torch-geometric"
 }
 
+# flash-attn 2.x ships kernels for exactly four targets -- sm_80, sm_90, sm_100
+# and sm_120 -- and picks them from its own FLASH_ATTN_CUDA_ARCHS variable, not
+# from TORCH_CUDA_ARCH_LIST. Left alone it compiles all four no matter what
+# --cuda-arch says, which is the single most expensive mistake in this script.
+#
+# The mapping below is not a filter: an sm_80 cubin also runs on sm_86/87/89,
+# because cubins stay binary compatible across a major compute revision. The
+# Blackwell entries are the exception, which is why 10.3 and 12.1 map to
+# nothing -- upstream torch keeps them as separate targets (see named_arches in
+# torch/utils/cpp_extension.py), so an sm_100/sm_120 cubin does not cover them.
+flash_attn_arch_for() {
+  case "$1" in
+    8.0|8.6|8.7|8.9) echo "80"  ;;
+    9.0)             echo "90"  ;;
+    10.0)            echo "100" ;;
+    12.0)            echo "120" ;;
+    *)               echo ""    ;;
+  esac
+}
+
+flash_attn_archs() {
+  local -a out=()
+  local a code
+  for a in ${TORCH_CUDA_ARCH_LIST:-}; do
+    code="$(flash_attn_arch_for "${a%%+*}")"
+    [[ -n "${code}" ]] || continue
+    [[ " ${out[*]} " == *" ${code} "* ]] || out+=("${code}")
+  done
+  (IFS=';'; echo "${out[*]}")
+}
+
 pkg_flash_attn() {
   if [[ "${PC_ACCEL}" != cu* ]]; then
     c_warn "flash-attn skipped: requires CUDA (target is ${PC_ACCEL})"
     record "skipped   flash-attn (non-CUDA target)"
     return 0
   fi
+
+  local archs; archs="$(flash_attn_archs)"
+  if [[ -z "${archs}" ]]; then
+    c_warn "flash-attn skipped: no target in '${TORCH_CUDA_ARCH_LIST:-}' has flash-attn 2.x kernels"
+    c_warn "  it supports sm_80/90/100/120 only; Turing, Orin-only and Thor builds have nothing to compile"
+    record "skipped   flash-attn (no supported arch in ${TORCH_CUDA_ARCH_LIST:-n/a})"
+    return 0
+  fi
+  c_log "flash-attn arch set: ${archs} (from ${TORCH_CUDA_ARCH_LIST})"
+
   # PyPI carries an sdist only, so this always compiles. It is by far the
-  # longest step; MAX_JOBS is what keeps it bounded.
-  build_wheel "flash-attn" "git+https://github.com/Dao-AILab/flash-attention.git@v2.8.3" \
-    "FLASH_ATTENTION_FORCE_BUILD=TRUE"
+  # longest step; MAX_JOBS and the arch set above are what keep it bounded.
+  build_wheel "flash-attn" "git+https://github.com/Dao-AILab/flash-attention.git@v2.8.3.post1" \
+    "FLASH_ATTENTION_FORCE_BUILD=TRUE" \
+    "FLASH_ATTN_CUDA_ARCHS=${archs}"
 }
 
 pkg_ocnn() {

@@ -239,9 +239,32 @@ If you find _Pointcept_ useful to your research, please cite our work as encoura
   # A single target, with the device code trimmed to one architecture
   ./scripts/build_wheels.sh build --arch arm64 --accel cu128 --cuda-arch "9.0"
 
+  # CUDA 13 (Thor, DGX Spark, Blackwell)
+  ./scripts/build_wheels.sh build --arch arm64 --accel cu130 --torch 2.9.1
+
   # AMD GPUs
   ./scripts/build_wheels.sh build --arch amd64 --accel rocm6.4 --rocm-arch "gfx90a;gfx942"
   ```
+
+  Accelerator tokens run from `cu118` through `cu132`, plus `rocm6.3`/`rocm6.4` and `cpu`. Each CUDA
+  release has a torch floor — `cu130` needs 2.9.0, `cu132` needs 2.12.0 — and pairings below it are
+  dropped from the matrix up front rather than failing an hour into the build. CUDA 13.1 is a special
+  case: NVIDIA ships base images for it but PyTorch never published a `cu131` wheel index (its 13.x line
+  goes `cu130` → `cu132`), so `--accel cu131` compiles with the 13.1 toolchain against `cu130` torch
+  wheels, which CUDA's minor version compatibility allows. Unless you specifically need that toolchain,
+  use `cu130` or `cu132`.
+
+  `build` also reports whether the result will run on the machine you are building it on: it compares the
+  host driver against the toolkit's floor (CUDA 13.x needs a 580+ driver) and the host GPU's compute
+  capability against the target arch list. Both are advisory — the build itself needs no GPU, and
+  cross-building for a different machine is the normal case — but they catch the "compiled fine, then
+  `no kernel image is available for execution on the device`" trap before it costs you an hour.
+
+  One package deserves a note: `flash-attn` 2.x only has kernels for sm_80, sm_90, sm_100 and sm_120, and
+  it reads its own arch variable rather than `--cuda-arch`, so on its own it compiles all four every time.
+  The script narrows it to the targets your `--cuda-arch` actually implies, and skips the package entirely
+  when none of them qualify (a Turing-only or Jetson Orin build, say). Expect it to dominate the wall clock
+  regardless — it is the one package with no prebuilt wheel anywhere.
 
   Docker is not required: the script probes `docker`, `podman` and `nerdctl` in that order and uses the
   first one that actually answers, so a box with only Podman works with no extra flags. Pick one explicitly
