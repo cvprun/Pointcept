@@ -353,7 +353,8 @@ ${C_BOLD}BUILD TUNING${C_RESET}
                      [auto-detect, in that order; env PC_ENGINE]
   --remote-host URI  Build on a remote daemon, e.g. ssh://arm-box
                      (alias: --docker-host)
-  --no-cache         Disable the shared pip/uv download cache
+  --no-cache         Disable the shared build cache (downloads AND the venv;
+                     every run then reprovisions torch from scratch)
   --keep-going       Continue to the next combination after a failure
   --dry-run          Print what would run without executing it
   -v, --verbose      Verbose logging (also streams compiler output)
@@ -382,6 +383,12 @@ ${C_BOLD}EXAMPLES${C_RESET}
   # Only the repository's own CUDA extensions
   ${SCRIPT_NAME} build --only pointops,pointgroup_ops,pointrope
 
+  # One package per sitting on a slow box: same target, resumable, accumulating
+  # into the same directory. The toolchain and torch are provisioned once.
+  T="--arch arm64 --accel cu130 --torch 2.9.1 --cuda-arch 12.1"   # DGX Spark
+  ${SCRIPT_NAME} build \${T} --only spconv        # pulls in pccm + cumm
+  ${SCRIPT_NAME} build \${T} --only torch-sparse
+
 ${C_BOLD}NOTES${C_RESET}
   * Cross-arch builds need QEMU: run '${SCRIPT_NAME} setup-qemu' once. QEMU makes
     nvcc extremely slow; for a full arm64 matrix prefer --remote-host against a
@@ -392,6 +399,11 @@ ${C_BOLD}NOTES${C_RESET}
   * Rootless engines (podman by default) cannot register binfmt handlers
     themselves; 'setup-qemu' prints the sudo / qemu-user-static alternatives.
     Output ownership is handled automatically either way.
+  * Packages can be built one invocation at a time with --only, which is how a
+    long arm64 matrix is made resumable. Every run is a separate container, so
+    the toolchain, the venv and the torch install are kept in a cache volume and
+    reused; the wheels accumulate in the same directory and manifest.txt is
+    appended to rather than rewritten. 'clean' drops both.
   * Wheels land in <out>/linux-<arch>/<accel>/torch<ver>-cp<py>/ with a
     manifest.txt recording how each wheel was obtained.
   * 'build' checks the host driver and GPU against each CUDA target and warns
@@ -926,6 +938,9 @@ engine_run_args() {
     args+=(-v "${OUT_DIR}/$(target_dir "${arch}" "${accel}" "${torch}" "${python}"):/out")
   fi
 
+  # The volume holds far more than downloads: see container_init_cache. It is
+  # what makes `--only <pkg>` runs cheap enough to build the matrix one package
+  # at a time, since the venv and its torch install survive between them.
   if [[ "${USE_CACHE}" == "1" ]]; then
     args+=(-v "pointcept-build-cache:/cache")
     # The cache volume and the venv are on different filesystems, so uv cannot
@@ -1127,7 +1142,9 @@ cmd_build() {
     [[ -n "${os}" ]] || continue
     index=$((index + 1))
 
-    local tag; tag="linux-${arch}/${accel}/torch${torch}-cp${python}"
+    # The same string the wheels are written under, so the header names a path
+    # that exists (cp312, not cp3.12).
+    local tag; tag="$(target_dir "${arch}" "${accel}" "${torch}" "${python}")"
     echo
     echo "${C_BOLD}${C_BLUE}=== [${index}/${total}] ${tag} ===${C_RESET}" >&2
 
@@ -1300,6 +1317,50 @@ c_warn() { echo "${C_YELLOW}  !!${C_RESET} $*" >&2; }
 MANIFEST="/out/manifest.txt"
 record() { echo "$1" >> "${MANIFEST}"; }
 
+# ------------------------------------------------------------------------------
+# Persistent build environment
+#
+# Every `build` runs a fresh --rm container, so anything provisioned inside it is
+# thrown away on exit. That is fine for a single sweep, but building the matrix
+# one package at a time -- the only practical way to do it on a slow native arm64
+# box, see --only -- would then pay for the apt install and a multi-gigabyte torch
+# install on every single step.
+#
+# So the three preparation phases below write into the /cache volume the host
+# mounts, and skip themselves outright when a previous run already filled it in:
+#
+#   /cache/apt     apt package lists and .debs
+#   /cache/bin     the uv binary
+#   /cache/python  uv-managed CPython builds -- a venv is a symlink farm into
+#                  its interpreter, so that has to outlive the container too
+#   /cache/venv/<key>   the build environment itself, torch and all
+#
+# The key spans every axis that changes what lands in the venv, so combinations
+# of the matrix never share one. Under --no-cache nothing is mounted, CACHE_ROOT
+# stays empty, and all three phases run in full against the container filesystem
+# exactly as they did before.
+# ------------------------------------------------------------------------------
+CACHE_ROOT=""
+VENV_DIR="/opt/venv"
+PY=""
+
+container_init_cache() {
+  if [[ ! -d /cache ]]; then
+    c_log "no cache volume mounted; provisioning the build environment from scratch"
+    return 0
+  fi
+  CACHE_ROOT=/cache
+  VENV_DIR="/cache/venv/${PC_OS}-${PC_ARCH}-${PC_ACCEL}-torch${PC_TORCH}-cp${PC_PYTHON//./}"
+  # apt insists the partial/ subdirectories exist before it will use either path.
+  mkdir -p /cache/apt/archives/partial /cache/apt/lists/partial /cache/bin /cache/python
+
+  # uv keeps its managed interpreters outside UV_CACHE_DIR, and a venv is a
+  # symlink farm into whichever one it was created from. `--python 3.12` gets a
+  # uv download rather than the base image's 3.12, so without this the venv would
+  # survive in the volume pointing at an interpreter the next container lacks.
+  export UV_PYTHON_INSTALL_DIR=/cache/python
+}
+
 container_prepare_system() {
   c_log "installing system toolchain"
   export DEBIAN_FRONTEND=noninteractive
@@ -1312,8 +1373,18 @@ container_prepare_system() {
 
   local redirect="/dev/null"; [[ "${PC_VERBOSE}" == "1" ]] && redirect="/dev/stderr"
 
-  apt-get update ${quiet} > "${redirect}"
-  apt-get install -y --no-install-recommends ${quiet} \
+  # The toolchain itself cannot be cached -- it installs into the container
+  # filesystem -- but its inputs can. With the lists in the volume `update` is a
+  # few InRelease checks instead of a 34 MB download, and with the archives there
+  # `install` is a pure dpkg unpack.
+  local -a apt_opts=()
+  if [[ -n "${CACHE_ROOT}" ]]; then
+    apt_opts=(-o "Dir::Cache::Archives=${CACHE_ROOT}/apt/archives"
+              -o "Dir::State::Lists=${CACHE_ROOT}/apt/lists")
+  fi
+
+  apt-get "${apt_opts[@]}" update ${quiet} > "${redirect}"
+  apt-get "${apt_opts[@]}" install -y --no-install-recommends ${quiet} \
     build-essential cmake ninja-build git curl ca-certificates \
     libopenblas-dev libsparsehash-dev pkg-config \
     > "${redirect}"
@@ -1321,34 +1392,62 @@ container_prepare_system() {
 }
 
 container_prepare_python() {
-  c_log "provisioning CPython ${PC_PYTHON} via uv"
-  export PATH="/root/.local/bin:${PATH}"
+  local uv_dir="/root/.local/bin"
+  [[ -n "${CACHE_ROOT}" ]] && uv_dir="${CACHE_ROOT}/bin"
+  export PATH="${uv_dir}:/root/.local/bin:${PATH}"
+
   if ! command -v uv >/dev/null 2>&1; then
+    c_log "installing uv into ${uv_dir}"
+    # The installer reads these from its own environment, and it is the piped
+    # `sh` that runs it -- a `VAR=x curl ... | sh` prefix would set them on curl
+    # and silently land uv back in ~/.local/bin, outside the cache volume.
+    export UV_INSTALL_DIR="${uv_dir}" INSTALLER_NO_MODIFY_PATH=1
     curl -LsSf https://astral.sh/uv/install.sh | sh >/dev/null 2>&1 \
       || die "failed to install uv"
+    hash -r
+    command -v uv >/dev/null 2>&1 || die "uv installed but not on PATH (${uv_dir})"
   fi
 
-  # A venv keeps the interpreter independent of whatever python the base image
-  # happens to ship, which is what makes the python axis of the matrix work.
-  # --seed is required: uv creates bare venvs, but `pip download` and
-  # `pip wheel` are the front-ends used below and they must exist in the venv.
-  uv venv --seed --python "${PC_PYTHON}" /opt/venv >/dev/null 2>&1 \
-    || die "uv could not provision CPython ${PC_PYTHON}"
-  export VIRTUAL_ENV=/opt/venv
-  export PATH="/opt/venv/bin:${PATH}"
-  PY=/opt/venv/bin/python
+  PY="${VENV_DIR}/bin/python"
+  if [[ -x "${PY}" ]] && "${PY}" -c 'import sys' >/dev/null 2>&1; then
+    c_ok "reusing build venv at ${VENV_DIR}"
+  else
+    c_log "provisioning CPython ${PC_PYTHON} via uv"
+    # A half-written venv from an interrupted run would fail the check above and
+    # confuse `uv venv`, so start from nothing rather than trying to repair it.
+    rm -rf "${VENV_DIR}"
+    mkdir -p "$(dirname "${VENV_DIR}")"
+    # A venv keeps the interpreter independent of whatever python the base image
+    # happens to ship, which is what makes the python axis of the matrix work.
+    # --seed is required: uv creates bare venvs, but `pip download` and
+    # `pip wheel` are the front-ends used below and they must exist in the venv.
+    uv venv --seed --python "${PC_PYTHON}" "${VENV_DIR}" >/dev/null 2>&1 \
+      || die "uv could not provision CPython ${PC_PYTHON}"
+  fi
+
+  export VIRTUAL_ENV="${VENV_DIR}"
+  export PATH="${VENV_DIR}/bin:${PATH}"
   c_ok "python $(${PY} -V 2>&1 | awk '{print $2}') at ${PY}"
 }
 
 container_install_torch() {
-  c_log "installing torch==${PC_TORCH} from ${PC_TORCH_INDEX}"
-  uv pip install --python "${PY}" \
-    --index-url "${PC_TORCH_INDEX}" \
-    "torch==${PC_TORCH}" \
-    || die "torch ${PC_TORCH} is not available for ${PC_ACCEL}/${PC_ARCH} on CPython ${PC_PYTHON}"
+  # A reused venv already carries torch and its several gigabytes of CUDA wheels.
+  # The local version suffix is what separates two builds of the same release
+  # (2.9.1+cu130 vs 2.9.1+cu128), so it has to be part of the comparison.
+  local have; have="$(${PY} -c 'import torch; print(torch.__version__)' 2>/dev/null || true)"
+  if [[ "${have}" == "${PC_TORCH}" || "${have}" == "${PC_TORCH}+"* ]]; then
+    c_ok "torch ${have} already provisioned"
+  else
+    c_log "installing torch==${PC_TORCH} from ${PC_TORCH_INDEX}"
+    uv pip install --python "${PY}" \
+      --index-url "${PC_TORCH_INDEX}" \
+      "torch==${PC_TORCH}" \
+      || die "torch ${PC_TORCH} is not available for ${PC_ACCEL}/${PC_ARCH} on CPython ${PC_PYTHON}"
+  fi
 
   # setup.py of every native package imports torch, so the build front-end needs
-  # these regardless of build isolation.
+  # these regardless of build isolation. Cheap to re-run: uv audits an already
+  # satisfied set in milliseconds.
   uv pip install --python "${PY}" setuptools wheel ninja packaging numpy >/dev/null
 
   local torch_ver cuda_ver
@@ -1444,6 +1543,46 @@ build_wheel() {
   c_ok "compiled  ${name}"
   record "compiled  ${name}"
   return 0
+}
+
+# Wheels land in /out; they are not installed. That is right for the output of a
+# build, but two packages here are also build *inputs*: cumm's setup.py imports
+# pccm at module scope and spconv's imports both. --no-build-isolation means pip
+# provisions nothing, so setup.py sees only what is already in the venv -- and a
+# missing one surfaces as a bare `ModuleNotFoundError` out of a pyproject hook,
+# thousands of lines into a log, with no hint that a sibling package is the fix.
+#
+# The wheel this run just produced is preferred over anything on an index: it was
+# built for this exact target, and for cumm that is the whole point -- a released
+# cumm carries a different (or no) CUDA build and would have spconv generate the
+# wrong kernels. So `fallback` is only passed for packages where an index copy is
+# genuinely interchangeable.
+install_build_dep() {
+  local name="$1" fallback="${2-}"
+
+  local whl=""
+  compgen -G "/out/${name}-*.whl" >/dev/null \
+    && whl="$(ls -t /out/"${name}"-*.whl | head -1)"
+
+  # No --no-deps: pccm and cumm are unimportable without theirs (ccimport,
+  # pybind11, fire), and those are pure python, so resolving them from the index
+  # is harmless. --reinstall-package pins the name to *this* wheel even when a
+  # same-version copy is already in a venv carried over from an earlier step.
+  if [[ -n "${whl}" ]] \
+     && uv pip install --python "${PY}" --reinstall-package "${name}" "${whl}" >/dev/null 2>&1; then
+    c_ok "build dep ${name} <- $(basename "${whl}")"
+    return 0
+  fi
+
+  if [[ -n "${fallback}" ]] \
+     && uv pip install --python "${PY}" "${fallback}" >/dev/null 2>&1; then
+    c_ok "build dep ${name} <- ${fallback} (index)"
+    return 0
+  fi
+
+  c_warn "${name} is required to build this package but could not be installed"
+  [[ -z "${whl}" ]] && c_warn "  no ${name} wheel in /out; build it first (--only ${name})"
+  return 1
 }
 
 pyg_find_links() {
@@ -1558,6 +1697,10 @@ pkg_cumm() {
 
   local archs; archs="$(cumm_arch_list_or_skip cumm)" || return 0
 
+  # pccm is imported by cumm's setup.py, so it has to be in the venv, not just
+  # in /out. The index copy is fine here: pccm is pure python and target neutral.
+  install_build_dep pccm pccm || return 1
+
   build_wheel "cumm" "git+https://github.com/FindDefinition/cumm.git" \
     "CUMM_DISABLE_JIT=1" \
     "CUMM_CUDA_ARCH_LIST=${archs}" \
@@ -1574,12 +1717,10 @@ pkg_spconv() {
 
   local archs; archs="$(cumm_arch_list_or_skip spconv)" || return 0
 
-  # A source build imports cumm at build time, so install the wheel produced by
-  # pkg_cumm (or a released one) before invoking setup.py.
-  if compgen -G "/out/cumm-*.whl" >/dev/null; then
-    uv pip install --python "${PY}" /out/cumm-*.whl >/dev/null 2>&1 || true
-  fi
-  uv pip install --python "${PY}" pccm >/dev/null 2>&1 || true
+  # setup.py imports both. cumm gets no index fallback: only the wheel built
+  # above knows this target's CUDA version and arch list.
+  install_build_dep pccm pccm || return 1
+  install_build_dep cumm      || return 1
 
   build_wheel "spconv" "git+https://github.com/traveller59/spconv.git" \
     "SPCONV_DISABLE_JIT=1" \
@@ -1718,13 +1859,19 @@ run_in_container() {
   VERBOSE="${PC_VERBOSE}"
 
   mkdir -p /out
-  : > "${MANIFEST}"
-  record "# built by build_wheels.sh for linux/${PC_ARCH} ${PC_ACCEL}"
+  # Appended, never truncated: --only makes "one package per invocation" a
+  # supported workflow, and each of those is a separate container writing to the
+  # same directory. Truncating would leave the manifest describing the last
+  # package built rather than the wheels actually sitting next to it.
+  record ""
+  record "# $(date -u '+%Y-%m-%d %H:%M:%SZ') build_wheels.sh linux/${PC_ARCH} ${PC_ACCEL} torch${PC_TORCH} cp${PC_PYTHON}"
   record "# cuda arch list: ${TORCH_CUDA_ARCH_LIST:-n/a}  rocm arch: ${PYTORCH_ROCM_ARCH:-n/a}"
+  record "# packages: ${PKG_LIST}"
 
   echo "${C_BOLD}target${C_RESET} linux/${PC_ARCH} ${PC_ACCEL} torch${PC_TORCH} cp${PC_PYTHON} jobs=${PC_JOBS}" >&2
   [[ -n "${TORCH_CUDA_ARCH_LIST:-}" ]] && echo "${C_BOLD}archs ${C_RESET} ${TORCH_CUDA_ARCH_LIST}" >&2
 
+  container_init_cache
   container_prepare_system
   container_prepare_python
   container_install_torch

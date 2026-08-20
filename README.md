@@ -273,10 +273,28 @@ If you find _Pointcept_ useful to your research, please cite our work as encoura
   under both rootful and rootless engines. The one thing a rootless engine cannot do is register QEMU
   binfmt handlers; `setup-qemu` detects that and prints the `sudo` / `qemu-user-static` alternatives.
 
+  A full matrix compiled natively on a slow machine can run for the better part of a day, so the build is
+  splittable: `--only <packages>` restricts one invocation to part of the set, and everything accumulates
+  into the same output directory. Dependencies come along automatically — `--only spconv` builds `pccm`
+  and `cumm` first, because both are imported by spconv's own `setup.py`.
+
+  ```bash
+  # One target, one package per sitting; resume whenever you like
+  T="--arch arm64 --accel cu130 --torch 2.9.1 --cuda-arch 12.1"   # DGX Spark (sm_121)
+  ./scripts/build_wheels.sh build $T --only spconv                # pccm + cumm + spconv
+  ./scripts/build_wheels.sh build $T --only torch-sparse
+  ./scripts/build_wheels.sh build $T --only pointops,pointops2,pointrope
+  ```
+
+  Each invocation is a separate container, which would normally mean paying for the apt toolchain and a
+  multi-gigabyte torch install every time. It does not: the toolchain's packages, the Python interpreter,
+  the virtualenv and its torch install are kept in a build cache volume keyed by the target, so only the
+  first run provisions anything. `--no-cache` opts out and `clean` drops the volume along with the wheels.
+
   Wheels land in `wheelhouse/linux-<arch>/<accel>/torch<ver>-cp<py>/`, each directory carrying a
-  `manifest.txt` that records whether a wheel was downloaded or compiled. Install them with
-  `pip install wheelhouse/linux-*/cu128/torch2.9.1-cp312/*.whl`, or fold them into a runnable image with
-  `./scripts/build_wheels.sh image --preset default`.
+  `manifest.txt` that records whether a wheel was downloaded or compiled, appended to once per run.
+  Install them with `pip install wheelhouse/linux-*/cu128/torch2.9.1-cp312/*.whl`, or fold them into a
+  runnable image with `./scripts/build_wheels.sh image --preset default`.
 
   Cross-architecture builds run under QEMU after a one-time `./scripts/build_wheels.sh setup-qemu`.
   QEMU-emulated `nvcc` is 10-30x slower than native, so for a full arm64 matrix point the script at a real
