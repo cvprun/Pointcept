@@ -1502,7 +1502,16 @@ build_wheel() {
   local -a env_pairs=("$@")
 
   c_log "compiling ${label} (this is the slow path)"
-  local before; before="$(ls /out/*.whl 2>/dev/null | wc -l)"
+
+  # pip builds into a staging directory, not straight into /out. /out is not
+  # empty on a second run -- `--only spconv` rebuilds cumm by design, and any
+  # package can be rerun -- and pointing --wheel-dir at it makes "did this build
+  # produce anything?" unanswerable: a rebuilt wheel overwrites its predecessor
+  # under the same name, and pip skips the work entirely when the file it was
+  # asked for is already sitting there ("File was already downloaded ..."). A
+  # directory that starts empty has neither problem: whatever lands in it is
+  # this build's output, and it is moved into /out afterwards.
+  local stage; stage="$(mktemp -d)"
 
   local -a cmd=(env "MAX_JOBS=${PC_JOBS}")
   [[ -n "${TORCH_CUDA_ARCH_LIST:-}" ]] && cmd+=("TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST}")
@@ -1512,7 +1521,7 @@ build_wheel() {
 
   # --no-build-isolation: these setup.py files import the *installed* torch to
   # discover the CUDA/HIP toolchain, which an isolated env would not have.
-  cmd+=("${PY}" -m pip wheel --no-deps --no-build-isolation --wheel-dir /out "${src}")
+  cmd+=("${PY}" -m pip wheel --no-deps --no-build-isolation --wheel-dir "${stage}" "${src}")
 
   local logfile="/tmp/${label//\//_}.log"
   local rc=0
@@ -1529,17 +1538,22 @@ build_wheel() {
   set -e
 
   if [[ ${rc} -ne 0 ]]; then
+    rm -rf "${stage}"
     c_warn "${label} failed; last 40 lines of ${logfile}:"
     tail -40 "${logfile}" >&2
     return 1
   fi
 
-  local after; after="$(ls /out/*.whl 2>/dev/null | wc -l)"
-  if [[ "${after}" -le "${before}" ]]; then
-    c_warn "${label} produced no wheel"
+  if ! compgen -G "${stage}/*.whl" >/dev/null; then
+    rm -rf "${stage}"
+    c_warn "${label}: pip reported success but produced no wheel"
     return 1
   fi
-  local name; name="$(ls -t /out/*.whl | head -1 | xargs basename)"
+
+  local name; name="$(basename "$(ls -t "${stage}"/*.whl | head -1)")"
+  mv -f "${stage}"/*.whl /out/
+  rm -rf "${stage}"
+
   c_ok "compiled  ${name}"
   record "compiled  ${name}"
   return 0
@@ -1558,30 +1572,36 @@ build_wheel() {
 # wrong kernels. So `fallback` is only passed for packages where an index copy is
 # genuinely interchangeable.
 install_build_dep() {
-  local name="$1" fallback="${2-}"
+  local pkg="$1" dist="$2" fallback="${3-}"
+
+  # `pkg` is what --only calls it; `dist` is what its setup.py names the
+  # distribution, and the two diverge exactly where it matters: CUMM_CUDA_VERSION
+  # renames cumm to cumm-cu130, which PEP 427 then escapes into the filename
+  # cumm_cu130-0.8.2-....whl. Globbing the package name finds nothing at all.
+  local esc="${dist//[-._]/_}"
 
   local whl=""
-  compgen -G "/out/${name}-*.whl" >/dev/null \
-    && whl="$(ls -t /out/"${name}"-*.whl | head -1)"
+  compgen -G "/out/${esc}-*.whl" >/dev/null \
+    && whl="$(ls -t /out/"${esc}"-*.whl | head -1)"
 
   # No --no-deps: pccm and cumm are unimportable without theirs (ccimport,
   # pybind11, fire), and those are pure python, so resolving them from the index
   # is harmless. --reinstall-package pins the name to *this* wheel even when a
   # same-version copy is already in a venv carried over from an earlier step.
   if [[ -n "${whl}" ]] \
-     && uv pip install --python "${PY}" --reinstall-package "${name}" "${whl}" >/dev/null 2>&1; then
-    c_ok "build dep ${name} <- $(basename "${whl}")"
+     && uv pip install --python "${PY}" --reinstall-package "${dist}" "${whl}" >/dev/null 2>&1; then
+    c_ok "build dep ${dist} <- $(basename "${whl}")"
     return 0
   fi
 
   if [[ -n "${fallback}" ]] \
      && uv pip install --python "${PY}" "${fallback}" >/dev/null 2>&1; then
-    c_ok "build dep ${name} <- ${fallback} (index)"
+    c_ok "build dep ${dist} <- ${fallback} (index)"
     return 0
   fi
 
-  c_warn "${name} is required to build this package but could not be installed"
-  [[ -z "${whl}" ]] && c_warn "  no ${name} wheel in /out; build it first (--only ${name})"
+  c_warn "${dist} is required to build this package but could not be installed"
+  [[ -z "${whl}" ]] && c_warn "  no ${esc}-*.whl in /out; build it first (--only ${pkg})"
   return 1
 }
 
@@ -1699,7 +1719,7 @@ pkg_cumm() {
 
   # pccm is imported by cumm's setup.py, so it has to be in the venv, not just
   # in /out. The index copy is fine here: pccm is pure python and target neutral.
-  install_build_dep pccm pccm || return 1
+  install_build_dep pccm pccm pccm || return 1
 
   build_wheel "cumm" "git+https://github.com/FindDefinition/cumm.git" \
     "CUMM_DISABLE_JIT=1" \
@@ -1718,9 +1738,13 @@ pkg_spconv() {
   local archs; archs="$(cumm_arch_list_or_skip spconv)" || return 0
 
   # setup.py imports both. cumm gets no index fallback: only the wheel built
-  # above knows this target's CUDA version and arch list.
-  install_build_dep pccm pccm || return 1
-  install_build_dep cumm      || return 1
+  # above knows this target's CUDA version and arch list -- and it carries the
+  # same accelerator suffix pkg_cumm compiled it under.
+  local cumm_dist="cumm"
+  [[ "${PC_ACCEL}" == cu* ]] && cumm_dist="cumm-${PC_ACCEL}"
+
+  install_build_dep pccm pccm pccm || return 1
+  install_build_dep cumm "${cumm_dist}" || return 1
 
   build_wheel "spconv" "git+https://github.com/traveller59/spconv.git" \
     "SPCONV_DISABLE_JIT=1" \
