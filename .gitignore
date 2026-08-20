@@ -15,3 +15,4 @@ wheelhouse/
 */.DS_Store
 **/*.out
 Dockerfile
+.claude/

@@ -1838,13 +1838,24 @@ pkg_ocnn() {
   build_wheel "ocnn" "git+https://github.com/octree-nn/ocnn-pytorch.git"
 }
 
+# microsoft/Swin3D is a single commit from June 2023 and does not compile against
+# a current PyTorch: its AT_DISPATCH_* calls pass tensor.type(), whose
+# at::DeprecatedTypeProperties overload has been removed, and it includes
+# <THC/THCAtomics.cuh> from the THC library that PyTorch deleted (what survives
+# is a shim header marked for removal). The fork below carries those fixes plus
+# the equivalent updates on the python side. Point this at your own fork or back
+# at upstream by editing the URL.
+SWIN3D_REPO="${PC_SWIN3D_REPO:-https://github.com/cvprun/Swin3D.git}"
+
 pkg_swin3d() {
   if [[ "${PC_ACCEL}" != cu* ]]; then
     c_warn "swin3d skipped: requires CUDA (target is ${PC_ACCEL})"
     record "skipped   swin3d (non-CUDA target)"
     return 0
   fi
-  build_wheel "swin3d" "git+https://github.com/microsoft/Swin3D.git"
+  c_log "swin3d source: ${SWIN3D_REPO}"
+  record "# swin3d source: ${SWIN3D_REPO}"
+  build_wheel "swin3d" "git+${SWIN3D_REPO}"
 }
 
 # Local extensions under libs/. The tree is copied out of the read-only mount

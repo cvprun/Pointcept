@@ -266,6 +266,15 @@ If you find _Pointcept_ useful to your research, please cite our work as encoura
   when none of them qualify (a Turing-only or Jetson Orin build, say). Expect it to dominate the wall clock
   regardless — it is the one package with no prebuilt wheel anywhere.
 
+  `swin3d` is built from a fork, not from `microsoft/Swin3D`. Upstream is a single commit from June 2023
+  and no longer compiles: its `AT_DISPATCH_*` calls pass `tensor.type()`, whose
+  `at::DeprecatedTypeProperties` overload PyTorch has removed, and it includes `<THC/THCAtomics.cuh>` from
+  the deleted THC library — what still resolves is a shim header carrying a "remove this" comment. The
+  fork also replaces the deprecated `torch.get_autocast_gpu_dtype()` and `torch.cuda.*Tensor` constructors,
+  and defers the `models`/`modules` imports so the CUDA extensions can be imported without MinkowskiEngine,
+  which has no build for current CUDA. Override the source with `PC_SWIN3D_REPO=<url>` (or edit
+  `SWIN3D_REPO` in the script) to build from your own fork or from upstream.
+
   Docker is not required: the script probes `docker`, `podman` and `nerdctl` in that order and uses the
   first one that actually answers, so a box with only Podman works with no extra flags. Pick one explicitly
   with `--engine podman` (or `PC_ENGINE=podman`). Engine differences are handled for you — fully qualified
