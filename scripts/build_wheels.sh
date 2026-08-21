@@ -1727,6 +1727,59 @@ pkg_cumm() {
     "CUMM_CUDA_VERSION=$(cumm_cuda_version)"
 }
 
+# spconv's setup.py caps cumm at `<0.8.0`. That ceiling was written on
+# 2024-12-15 -- the date of spconv's last commit -- while cumm 0.8.0 landed
+# three months later, so it guards against a minor that did not exist yet
+# rather than one that was tried and rejected. cumm 0.8.0 is a pure version
+# bump: its diff against 0.7.13 is CHANGELOG.md and version.txt and nothing
+# else. It exists so *published* spconv wheels would not pair with cumm
+# prebuilts from a CI whose gcc had changed -- the two extensions hand pybind11
+# objects across the module boundary, which is ABI-sensitive. Here one
+# toolchain compiles both in one container, so that pairing holds by
+# construction. And the ceiling has to lift regardless: only cumm 0.8.x knows
+# the Blackwell arches (10.0, 12.0) that a cu128+ target needs.
+SPCONV_REPO="${PC_SPCONV_REPO:-https://github.com/traveller59/spconv.git}"
+
+# Clone spconv and raise that ceiling to the next minor above the cumm this
+# build will link against. Echoes the path to the patched tree.
+spconv_patched_source() {
+  local cumm_dist="$1"
+  local work="/tmp/spconv-src"
+
+  rm -rf "${work}"
+  git clone --quiet --depth 1 "${SPCONV_REPO}" "${work}" || {
+    c_warn "spconv: could not clone ${SPCONV_REPO}"
+    return 1
+  }
+
+  # Read the version off the installed distribution rather than by importing
+  # cumm: `cumm-cu130` is the name the pin is written against, and metadata
+  # needs no CUDA runtime to answer. install_build_dep gave cumm no index
+  # fallback, so this is the wheel pkg_cumm just built for this target.
+  local ver ceiling
+  ver="$(${PY} -c "from importlib.metadata import version; print(version('${cumm_dist}'))" 2>/dev/null)" || {
+    c_warn "spconv: ${cumm_dist} reports no version; cannot size the pin"
+    return 1
+  }
+  ceiling="$(awk -F. '{print $1"."($2+1)".0"}' <<< "${ver}")"
+
+  # Both branches of setup.py's `if cuda_ver:` carry the same specifier -- one
+  # for cumm-cuXYZ, one for plain cumm -- so this is a global substitution.
+  sed -i -E "s/(cumm[^\"]*>=[0-9.]+, *<)[0-9]+\.[0-9]+\.[0-9]+/\1${ceiling}/g" \
+    "${work}/setup.py"
+
+  # A silent miss would rebuild the exact wheel that cannot be installed, and
+  # nothing would say so until pip ran against the finished wheelhouse.
+  grep -q "cumm[^\"]*<${ceiling}" "${work}/setup.py" || {
+    c_warn "spconv: no cumm pin matched in setup.py; upstream changed its shape"
+    return 1
+  }
+
+  c_ok "spconv: cumm ceiling raised to <${ceiling} (built against ${cumm_dist} ${ver})"
+  record "# spconv: cumm pin relaxed to <${ceiling} (built against ${cumm_dist} ${ver})"
+  echo "${work}"
+}
+
 pkg_spconv() {
   spconv_family_supported "spconv" || return 0
 
@@ -1746,7 +1799,14 @@ pkg_spconv() {
   install_build_dep pccm pccm pccm || return 1
   install_build_dep cumm "${cumm_dist}" || return 1
 
-  build_wheel "spconv" "git+https://github.com/traveller59/spconv.git" \
+  # A patched checkout rather than the git+ URL: what pip resolves later is the
+  # metadata baked into the wheel, and upstream's ceiling makes that wheel
+  # uninstallable beside the cumm it was just compiled against.
+  c_log "spconv source: ${SPCONV_REPO}"
+  record "# spconv source: ${SPCONV_REPO}"
+  local src; src="$(spconv_patched_source "${cumm_dist}")" || return 1
+
+  build_wheel "spconv" "${src}" \
     "SPCONV_DISABLE_JIT=1" \
     "CUMM_CUDA_ARCH_LIST=${archs}" \
     "CUMM_CUDA_VERSION=$(cumm_cuda_version)"

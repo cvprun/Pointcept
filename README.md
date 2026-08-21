@@ -275,6 +275,18 @@ If you find _Pointcept_ useful to your research, please cite our work as encoura
   which has no build for current CUDA. Override the source with `PC_SWIN3D_REPO=<url>` (or edit
   `SWIN3D_REPO` in the script) to build from your own fork or from upstream.
 
+  `spconv` comes from upstream, but through a patched checkout rather than straight from the git URL. Its
+  `setup.py` caps cumm at `<0.8.0` — a ceiling written on 2024-12-15, the date of spconv's last commit,
+  while cumm 0.8.0 landed three months later. It guards against a minor that did not exist yet rather than
+  one that was tried and rejected: cumm 0.8.0 is a pure version bump, its diff against 0.7.13 being
+  `CHANGELOG.md` and `version.txt` and nothing else, made so that *published* spconv wheels would not pair
+  with cumm prebuilts from a CI whose gcc had changed. Here one toolchain compiles both in one container,
+  so that pairing holds by construction — and the ceiling has to lift regardless, because only cumm 0.8.x
+  knows the Blackwell arches (10.0, 12.0) a cu128+ target needs. The script raises it to the next minor
+  above the cumm it just built and notes the new bound in the manifest; if upstream ever reshapes the pin
+  it fails the package rather than emitting a wheel pip cannot install beside its own cumm. Override the
+  source with `PC_SPCONV_REPO=<url>` (or edit `SPCONV_REPO` in the script).
+
   Docker is not required: the script probes `docker`, `podman` and `nerdctl` in that order and uses the
   first one that actually answers, so a box with only Podman works with no extra flags. Pick one explicitly
   with `--engine podman` (or `PC_ENGINE=podman`). Engine differences are handled for you — fully qualified
