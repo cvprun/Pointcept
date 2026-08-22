@@ -64,7 +64,19 @@ MODULE_TABLE=(
 )
 
 # Python packages the model stage needs that are not wheels under test.
-RUNTIME_DEPS=(addict einops timm numpy)
+#
+# `import pointcept.models` runs every model family, not just the one the stage
+# builds: models/__init__.py imports them all, and models/modules.py reaches
+# into pointcept.engines.hooks on the way. The list below is that whole
+# module-level closure -- peft (default.py), transformers and timm (concerto,
+# utonia), scipy (sgiformer), wandb (engines/hooks) -- and all of it is pure
+# python. A miss here surfaces as a ModuleNotFoundError in the model stage,
+# which says nothing at all about the wheels under test.
+#
+# torchvision belongs to the same closure (utonia) and is deliberately absent:
+# it is compiled against one specific libtorch, so it is installed next to torch
+# from the same index in stage_install rather than resolved from PyPI here.
+RUNTIME_DEPS=(addict einops timm numpy packaging peft scipy transformers wandb)
 
 # ------------------------------------------------------------------------------
 # Logging
@@ -121,6 +133,8 @@ ${C_BOLD}OPTIONS${C_RESET}
   --venv DIR         Create the throwaway venv here (default: a temp dir).
   --keep             Keep the venv after the run (it prints the path).
   --no-torch         Do not install torch; the venv is expected to have it.
+                     torchvision is installed alongside torch, so the model
+                     stage expects that one to be present already too.
   --torch-index URL  pip index for torch (default: derived from the accel in
                      the wheelhouse path, e.g. cu130 -> .../whl/cu130).
   --quick            Stop after the import stage; skip kernels and the model.
@@ -296,18 +310,39 @@ stage_install() {
     # The torch version is in the wheelhouse path (torch2.9.1-cp312).
     local want; want="$(basename "${WHEELHOUSE}")"
     want="${want#torch}"; want="${want%%-*}"
-    c_log "  torch==${want} from ${index:-PyPI}"
+    # torchvision rides along in this call rather than sitting in RUNTIME_DEPS:
+    # it pins the torch it was compiled against, so resolving it afterwards
+    # either fails or quietly installs a second libtorch over the one every
+    # wheel here was linked to. Asked for beside a pinned torch, pip picks the
+    # build that matches.
+    c_log "  torch==${want} + torchvision from ${index:-PyPI}"
     if [[ -n "${index}" ]]; then
-      "${PY}" -m pip install --quiet "torch==${want}" --index-url "${index}" || return 1
+      "${PY}" -m pip install --quiet "torch==${want}" torchvision --index-url "${index}" || return 1
     else
-      "${PY}" -m pip install --quiet "torch==${want}" || return 1
+      "${PY}" -m pip install --quiet "torch==${want}" torchvision || return 1
     fi
   fi
+
+  # Every native wheel below was linked against the torch that is installed now,
+  # so anything that swaps it out invalidates the rest of the run.
+  local before after
+  before="$("${PY}" -c 'import torch; print(torch.__version__)' 2>/dev/null || true)"
 
   # One pip call for every wheel: they depend on each other (spconv needs cumm
   # needs pccm) and resolving them together keeps pip from reaching for PyPI.
   "${PY}" -m pip install --quiet "${WHEELS[@]}" || return 1
   "${PY}" -m pip install --quiet "${RUNTIME_DEPS[@]}" || return 1
+
+  # peft and transformers carry their own torch specifiers, and pip may satisfy
+  # one by replacing torch with a PyPI build that has no CUDA at all -- after
+  # which every later stage reports "no CUDA device visible" and none of it is
+  # about the wheels. Name it here instead.
+  after="$("${PY}" -c 'import torch; print(torch.__version__)' 2>/dev/null || true)"
+  if [[ -n "${before}" && "${before}" != "${after}" ]]; then
+    c_fail "  torch was replaced during install: ${before} -> ${after:-none}"
+    c_fail "  a runtime dep pulled its own torch; these wheels are linked to ${before}"
+    return 1
+  fi
 }
 
 # ------------------------------------------------------------------------------
@@ -337,7 +372,12 @@ stage_import() {
         continue
       fi
     fi
-    if out="$("${PY}" -c "import ${mod}; print(getattr(${mod}, '__version__', ''))" 2>&1)"; then
+    # torch first, always. Most of these are packages whose __init__ imports
+    # torch itself, but pointrope is a bare CUDAExtension -- the .so *is* the
+    # top-level module -- and it resolves libc10 through the RTLD_GLOBAL handles
+    # torch opens on import. Without that line it fails with a missing
+    # libc10.so, which reads like a broken wheel and is not one.
+    if out="$("${PY}" -c "import torch; import ${mod}; print(getattr(${mod}, '__version__', ''))" 2>&1)"; then
       c_ok "${mod} ${out}"
     elif [[ "${required}" == "no" ]]; then
       c_skip "${mod} (optional, not importable)"
@@ -429,8 +469,18 @@ def t_pointrope():
     # tokens are (B, N, H, C) and the kernel splits C into 3 axes x 2 halves,
     # so C has to be a multiple of 6 (see Q = D / 6 in kernels.cu).
     tokens = torch.rand(1, 64, 4, 24, device=dev).contiguous()
-    positions = torch.rand(1, 64, 3, device=dev).contiguous()
+    # positions are read as `pos.data_ptr<int64_t>()`, so a float tensor is not
+    # converted, it is refused. They are voxel indices: Pointcept passes
+    # point.grid_coord straight through (litept_v1.py). Ramped rather than
+    # random so the "did anything rotate?" check below cannot draw all zeros.
+    positions = (
+        torch.arange(64, dtype=torch.int64, device=dev).view(1, 64, 1).repeat(1, 1, 3).contiguous()
+    )
+    before = tokens.clone()
     pointrope.pointrope(tokens, positions, 100.0, 1.0)
+    # The op rotates in place and returns nothing, so shape proves nothing here.
+    assert torch.isfinite(tokens).all(), "pointrope produced non-finite tokens"
+    assert not torch.equal(tokens, before), "pointrope left the tokens untouched"
 
 
 def t_pointseg():
@@ -500,6 +550,10 @@ def t_torch_sparse():
 def t_torch_geometric():
     from torch_geometric.nn.pool import voxel_grid
 
+    # torch-geometric 2.8 moved grid_cluster from torch-cluster to pyg-lib, and
+    # pyg-lib publishes no aarch64 wheel; build_wheels.sh holds torch-geometric
+    # below 2.8 for that reason. An ImportError naming pyg-lib here means the
+    # wheelhouse predates that pin.
     cluster = voxel_grid(xyz, size=0.1, batch=torch.zeros(N, dtype=torch.long, device=dev))
     assert cluster.numel() == N
 

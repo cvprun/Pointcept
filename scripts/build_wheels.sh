@@ -1461,6 +1461,29 @@ container_install_torch() {
   fi
 }
 
+# Drop every other build of one distribution from /out.
+#
+# /out is reused across runs, and a version change lands under a new filename
+# instead of overwriting the old one -- so a bumped pin, a newer release on the
+# index or a rebuilt local package leaves both copies behind. That is not a
+# wheelhouse: verify_wheels.sh and every install recipe hand pip the whole
+# directory at once, and pip has no way to choose between two versions of the
+# same name. The wheel that just landed is by definition the one this run
+# means, so the others go.
+prune_stale_wheels() {
+  local keep="$1"
+  local dist; dist="$(basename "${keep}")"; dist="${dist%%-*}"
+
+  compgen -G "/out/${dist}-*.whl" >/dev/null || return 0
+  local other
+  for other in /out/"${dist}"-*.whl; do
+    [[ "$(basename "${other}")" == "$(basename "${keep}")" ]] && continue
+    rm -f "${other}"
+    c_warn "removed stale $(basename "${other}") (superseded by $(basename "${keep}"))"
+    record "# removed stale $(basename "${other}")"
+  done
+}
+
 # Try to fetch a prebuilt wheel for the current interpreter/platform. Returns 0
 # and drops the wheel into /out when one exists, 1 when the package has to be
 # compiled. This is the check that makes amd64 fast and arm64 correct.
@@ -1487,6 +1510,7 @@ try_prebuilt() {
     local name; name="$(basename "$(ls "${tmp}"/*.whl | head -1)")"
     cp "${tmp}"/*.whl /out/
     rm -rf "${tmp}"
+    prune_stale_wheels "/out/${name}"
     c_ok "prebuilt  ${name}"
     record "prebuilt  ${name}"
     return 0
@@ -1553,6 +1577,7 @@ build_wheel() {
   local name; name="$(basename "$(ls -t "${stage}"/*.whl | head -1)")"
   mv -f "${stage}"/*.whl /out/
   rm -rf "${stage}"
+  prune_stale_wheels "/out/${name}"
 
   c_ok "compiled  ${name}"
   record "compiled  ${name}"
@@ -1861,9 +1886,21 @@ pkg_torch_scatter() { pkg_pyg_ext "torch-scatter" "rusty1s/pytorch_scatter"; }
 pkg_torch_sparse()  { pkg_pyg_ext "torch-sparse"  "rusty1s/pytorch_sparse";  }
 pkg_torch_cluster() { pkg_pyg_ext "torch-cluster" "rusty1s/pytorch_cluster"; }
 
+# torch-geometric 2.8 moved grid_cluster out of torch-cluster and into pyg-lib:
+# `voxel_grid` now raises ImportError unless pyg_lib.ops exposes it (see
+# WITH_GRID_CLUSTER in torch_geometric/typing.py). Pointcept calls voxel_grid
+# from PTv2, OACNNs, StratifiedTransformer and MaskedSceneContrast, so 2.8 takes
+# those models out -- and pyg-lib cannot fill the gap here: it is not on PyPI at
+# all, only on data.pyg.org, which publishes linux_x86_64 and win_amd64 and
+# nothing for aarch64. Staying below 2.8 keeps voxel_grid on the torch-cluster
+# this script already builds for every target. Raise it once pyg-lib ships arm64
+# wheels, or once Pointcept stops calling voxel_grid.
+PYG_MAX="${PC_PYG_MAX:-2.8}"
+
 pkg_torch_geometric() {
-  try_prebuilt "torch-geometric" && return 0
-  build_wheel "torch-geometric" "torch-geometric"
+  local spec="torch-geometric<${PYG_MAX}"
+  try_prebuilt "${spec}" && return 0
+  build_wheel "torch-geometric" "${spec}"
 }
 
 # flash-attn 2.x ships kernels for exactly four targets -- sm_80, sm_90, sm_100

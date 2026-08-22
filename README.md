@@ -287,6 +287,14 @@ If you find _Pointcept_ useful to your research, please cite our work as encoura
   it fails the package rather than emitting a wheel pip cannot install beside its own cumm. Override the
   source with `PC_SPCONV_REPO=<url>` (or edit `SPCONV_REPO` in the script).
 
+  `torch-geometric` is held below 2.8. That release moved `grid_cluster` out of `torch-cluster` and into
+  `pyg-lib`, so `voxel_grid` raises `ImportError: voxel_grid requires pyg-lib>=0.6.0` — and Pointcept calls
+  `voxel_grid` from PTv2, OACNNs, StratifiedTransformer and MaskedSceneContrast. pyg-lib cannot fill that
+  gap on this target: it is not published on PyPI at all, only through `data.pyg.org`, which carries
+  `linux_x86_64` and `win_amd64` wheels and nothing for aarch64. Below 2.8, `voxel_grid` still runs on the
+  `torch-cluster` this script builds for every target. Raise the bound with `PC_PYG_MAX=<version>` once
+  pyg-lib ships arm64 wheels.
+
   Docker is not required: the script probes `docker`, `podman` and `nerdctl` in that order and uses the
   first one that actually answers, so a box with only Podman works with no extra flags. Pick one explicitly
   with `--engine podman` (or `PC_ENGINE=podman`). Engine differences are handled for you — fully qualified
