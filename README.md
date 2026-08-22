@@ -297,7 +297,11 @@ If you find _Pointcept_ useful to your research, please cite our work as encoura
   A full matrix compiled natively on a slow machine can run for the better part of a day, so the build is
   splittable: `--only <packages>` restricts one invocation to part of the set, and everything accumulates
   into the same output directory. Dependencies come along automatically — `--only spconv` builds `pccm`
-  and `cumm` first, because both are imported by spconv's own `setup.py`.
+  and `cumm` first, because both are imported by spconv's own `setup.py`. cumm is uninstalled from the
+  cached venv immediately before it is rebuilt: its `setup.py` *appends* its own source directory to
+  `sys.path` rather than prepending it, so a copy left installed by an earlier run shadows the tree pip
+  just cloned, and pccm then emits every binding a namespace level too deep — a wheel that compiles and
+  installs without a word and only fails once spconv's build imports it.
 
   ```bash
   # One target, one package per sitting; resume whenever you like

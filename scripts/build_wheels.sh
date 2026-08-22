@@ -1721,6 +1721,22 @@ pkg_cumm() {
   # in /out. The index copy is fine here: pccm is pure python and target neutral.
   install_build_dep pccm pccm pccm || return 1
 
+  # cumm has to build against its own source tree, and its setup.py reaches for
+  # that tree with `sys.path.append` rather than an insert -- so an already
+  # installed cumm sits ahead of it and wins the import. pccm then reads the
+  # pccm classes out of site-packages, cannot express those paths relative to
+  # the namespace root the extension was handed, and falls back to their fully
+  # qualified names (pccm/core/__init__.py, extract_module_id_of_class). Every
+  # binding lands a level too deep: cumm.core_cc.cumm.tensorview_bind instead of
+  # cumm.core_cc.tensorview_bind. That wheel compiles, installs and imports
+  # without a word, and only spconv's setup.py finds out. The venv outlives an
+  # --only run and pkg_spconv leaves cumm installed in it, so this would spoil
+  # every rebuild after the first. Hand the build a venv with no cumm in it.
+  local d
+  for d in cumm "${variant}"; do
+    uv pip uninstall --python "${PY}" "${d}" >/dev/null 2>&1 || true
+  done
+
   build_wheel "cumm" "git+https://github.com/FindDefinition/cumm.git" \
     "CUMM_DISABLE_JIT=1" \
     "CUMM_CUDA_ARCH_LIST=${archs}" \
@@ -1798,6 +1814,17 @@ pkg_spconv() {
 
   install_build_dep pccm pccm pccm || return 1
   install_build_dep cumm "${cumm_dist}" || return 1
+
+  # The one thing spconv needs from cumm that a broken build still installs
+  # cleanly (see pkg_cumm): the binding submodule. Asking here costs a python
+  # startup and turns a traceback thousands of lines into a compile log into a
+  # sentence naming the package that has to be rebuilt.
+  if ! "${PY}" -c 'from cumm.core_cc import tensorview_bind' >/dev/null 2>&1; then
+    c_warn "${cumm_dist} has no core_cc.tensorview_bind; its bindings were generated"
+    c_warn "  against an installed cumm rather than its own source. Rebuild it with"
+    c_warn "  --only cumm, which now clears the venv first."
+    return 1
+  fi
 
   # A patched checkout rather than the git+ URL: what pip resolves later is the
   # metadata baked into the wheel, and upstream's ceiling makes that wheel
