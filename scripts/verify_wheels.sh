@@ -612,7 +612,15 @@ except ImportError:
     has_flash = False
 print(f"  flash_attn   {'present' if has_flash else 'absent (fallback path)'}")
 
-from pointcept.models.point_transformer_v3 import PointTransformerV3
+# The m1 module by name, not the package. All three PTv3 variants define a class
+# called PointTransformerV3 and __init__.py star-imports them m1 -> m2 -> m3, so
+# the bare name is whichever came last -- today m3 (utonia), whose Point3DRoPE
+# asserts head_dim % 3 == 0 while PTv3's default head_dim is 16 at every stage.
+# The registry keeps the three apart (PT-v3m1/m2/m3); a direct import does not.
+# m1 is the backbone this stage means: the one the wheels below it have to carry.
+from pointcept.models.point_transformer_v3.point_transformer_v3m1_base import (
+    PointTransformerV3,
+)
 
 dev = torch.device("cuda")
 N = 20000
