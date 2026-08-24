@@ -136,7 +136,8 @@ ${C_BOLD}OPTIONS${C_RESET}
                      torchvision is installed alongside torch, so the model
                      stage expects that one to be present already too.
   --torch-index URL  pip index for torch (default: derived from the accel in
-                     the wheelhouse path, e.g. cu130 -> .../whl/cu130).
+                     the wheelhouse path -- cu130, rocm6.4 and cpu each map
+                     straight onto download.pytorch.org/whl/<accel>).
   --quick            Stop after the import stage; skip kernels and the model.
   --python BIN       Interpreter used to create the venv (default: python3).
   -h, --help         Show this message.
@@ -303,9 +304,17 @@ stage_install() {
   c_log "stage install: torch + ${#WHEELS[@]} wheels into ${VENV_DIR}"
 
   if [[ "${INSTALL_TORCH}" == "1" ]]; then
+    # download.pytorch.org keys its indices by exactly the token this script
+    # already has: cu130, rocm6.4, cpu. Deriving one only for cu* left the other
+    # two resolving torch from PyPI, where the wheels are CUDA builds for both
+    # x86_64 and aarch64 -- so a cpu or ROCm wheelhouse was tested against a
+    # libtorch it had never been linked to, and everything that failed
+    # afterwards was about that and not about the wheels.
     local index="${TORCH_INDEX}"
-    if [[ -z "${index}" && "${ACCEL}" == cu* ]]; then
-      index="https://download.pytorch.org/whl/${ACCEL}"
+    if [[ -z "${index}" ]]; then
+      case "${ACCEL}" in
+        cu*|rocm*|cpu) index="https://download.pytorch.org/whl/${ACCEL}" ;;
+      esac
     fi
     # The torch version is in the wheelhouse path (torch2.9.1-cp312).
     local want; want="$(basename "${WHEELHOUSE}")"
