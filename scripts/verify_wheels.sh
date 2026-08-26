@@ -117,6 +117,8 @@ INSTALL_TORCH="1"
 TORCH_INDEX=""
 QUICK="0"
 PYTHON_BIN="python3"
+USE_UV="1"
+UV_BIN=""
 
 usage() {
   cat <<EOF
@@ -140,12 +142,16 @@ ${C_BOLD}OPTIONS${C_RESET}
                      straight onto download.pytorch.org/whl/<accel>).
   --quick            Stop after the import stage; skip kernels and the model.
   --python BIN       Interpreter used to create the venv (default: python3).
+                     With uv this may also be a bare version -- '3.12' -- which
+                     uv downloads if the host has no such interpreter.
+  --no-uv            Create the venv with 'python -m venv' and install with pip
+                     even when uv is available.
   -h, --help         Show this message.
 
 ${C_BOLD}STAGES${C_RESET}
   env       interpreter, torch, CUDA runtime, driver and GPU capability
   tags      wheel filename tags against this interpreter and platform
-  install   pip install torch + every wheel into a fresh venv
+  install   install torch + every wheel into a fresh venv (uv, else pip)
   import    import each module by the name Pointcept actually uses
   kernel    run one real op per native package (forces cubin/PTX to load)
   model     build PTv3 and run a forward pass on synthetic points
@@ -154,6 +160,9 @@ ${C_BOLD}NOTES${C_RESET}
   * flash-attn is optional: on sm_121 / sm_110 it has no kernels and
     build_wheels.sh skips it, which the model stage compensates for by
     disabling flash attention. Its absence is not a failure.
+  * The venv is created and populated with uv when it is on PATH, the same
+    front-end build_wheels.sh uses, so the two share a wheel cache. Without uv
+    the script falls back to 'python -m venv' and pip; --no-uv forces that.
   * The kernel stage is where a PTX-only spconv build shows itself. The first
     launch can take tens of seconds while the driver JITs; that is normal, a
     'no kernel image is available for execution' is not.
@@ -169,11 +178,41 @@ while [[ $# -gt 0 ]]; do
     --torch-index) TORCH_INDEX="${2:?--torch-index needs a URL}"; shift 2 ;;
     --quick)       QUICK="1"; shift ;;
     --python)      PYTHON_BIN="${2:?--python needs a binary}"; shift 2 ;;
+    --no-uv)       USE_UV="0"; shift ;;
     -h|--help)     usage; exit 0 ;;
     -*)            c_die "unknown option: $1 (see --help)" ;;
     *)             WHEELHOUSE="$1"; shift ;;
   esac
 done
+
+# ------------------------------------------------------------------------------
+# Package front-end
+#
+# build_wheels.sh provisions its build environment with uv, and the same reasons
+# apply to the throwaway venv here: resolving a wheelhouse against a multi-
+# gigabyte torch is the slow part of this script, and uv's cache makes the
+# second run of the day cheap. It also creates the venv from a CPython it
+# downloads itself, so --python 3.12 works on a host that only ships 3.10.
+#
+# pip stays as the fallback rather than a hard requirement -- this script is
+# meant to be runnable on a freshly imaged target machine, which is exactly the
+# host least likely to have uv on it.
+# ------------------------------------------------------------------------------
+if [[ "${USE_UV}" == "1" ]]; then
+  UV_BIN="$(command -v uv || true)"
+  # The installer's default location, in case this shell's PATH predates it.
+  [[ -z "${UV_BIN}" && -x "${HOME}/.local/bin/uv" ]] && UV_BIN="${HOME}/.local/bin/uv"
+fi
+
+# Install into ${PY} whichever front-end we have. Every flag used at the call
+# sites -- --quiet, --upgrade, --index-url -- means the same thing to both.
+py_install() {
+  if [[ -n "${UV_BIN}" ]]; then
+    "${UV_BIN}" pip install --python "${PY}" "$@"
+  else
+    "${PY}" -m pip install "$@"
+  fi
+}
 
 # ------------------------------------------------------------------------------
 # Locate the wheelhouse
@@ -326,9 +365,9 @@ stage_install() {
     # build that matches.
     c_log "  torch==${want} + torchvision from ${index:-PyPI}"
     if [[ -n "${index}" ]]; then
-      "${PY}" -m pip install --quiet "torch==${want}" torchvision --index-url "${index}" || return 1
+      py_install --quiet "torch==${want}" torchvision --index-url "${index}" || return 1
     else
-      "${PY}" -m pip install --quiet "torch==${want}" torchvision || return 1
+      py_install --quiet "torch==${want}" torchvision || return 1
     fi
   fi
 
@@ -339,8 +378,8 @@ stage_install() {
 
   # One pip call for every wheel: they depend on each other (spconv needs cumm
   # needs pccm) and resolving them together keeps pip from reaching for PyPI.
-  "${PY}" -m pip install --quiet "${WHEELS[@]}" || return 1
-  "${PY}" -m pip install --quiet "${RUNTIME_DEPS[@]}" || return 1
+  py_install --quiet "${WHEELS[@]}" || return 1
+  py_install --quiet "${RUNTIME_DEPS[@]}" || return 1
 
   # peft and transformers carry their own torch specifiers, and pip may satisfy
   # one by replacing torch with a PyPI build that has no CUDA at all -- after
@@ -676,18 +715,44 @@ if [[ "${IN_PLACE}" == "1" ]]; then
   [[ -n "${PY}" ]] || c_die "no python3 on PATH"
   c_log "verifying the active environment: ${PY}"
 else
-  command -v "${PYTHON_BIN}" >/dev/null || c_die "interpreter not found: ${PYTHON_BIN}"
+  # Only pip needs the interpreter to already exist; uv is asked for a version
+  # and fetches one when the host has none.
+  if [[ -z "${UV_BIN}" ]]; then
+    command -v "${PYTHON_BIN}" >/dev/null || c_die "interpreter not found: ${PYTHON_BIN}"
+  fi
   if [[ -z "${VENV_DIR}" ]]; then
     VENV_DIR="$(mktemp -d -t pointcept-verify-XXXXXX)"
     CLEANUP_VENV="${VENV_DIR}"
   fi
-  c_log "creating venv: ${VENV_DIR}"
-  "${PYTHON_BIN}" -m venv "${VENV_DIR}"
   PY="${VENV_DIR}/bin/python"
+  if [[ -n "${UV_BIN}" ]]; then
+    # `uv venv --python python3` is a *request*, not a path: uv answers it from
+    # its own managed interpreters first, so the default would silently build
+    # the venv from a uv-downloaded 3.14 while the wheels under test are cp312
+    # for the host's python3. Resolve the name here and hand uv the binary, and
+    # a bare version ('--python 3.12') still goes through uv's downloader.
+    UV_PYTHON="${PYTHON_BIN}"
+    if command -v "${PYTHON_BIN}" >/dev/null 2>&1; then
+      UV_PYTHON="$(command -v "${PYTHON_BIN}")"
+    fi
+    c_log "creating venv with uv: ${VENV_DIR} (${UV_PYTHON})"
+    # mktemp already made the directory, and uv treats a non-empty target as a
+    # venv to replace, so hand it a clean path either way.
+    rm -rf "${VENV_DIR}"
+    # No --seed: nothing below reaches for the venv's own pip, uv installs into
+    # it from the outside via --python.
+    "${UV_BIN}" venv --python "${UV_PYTHON}" "${VENV_DIR}" >/dev/null \
+      || c_die "uv could not create a venv for ${PYTHON_BIN}"
+  else
+    [[ "${USE_UV}" == "1" ]] && c_warn "uv not found; falling back to python -m venv"
+    c_log "creating venv: ${VENV_DIR}"
+    "${PYTHON_BIN}" -m venv "${VENV_DIR}"
+    py_install --upgrade --quiet pip
+  fi
   # Bootstrapped here rather than in stage_install so the tag check -- which
   # needs packaging.tags -- can run first and explain an install failure
   # instead of following it.
-  "${PY}" -m pip install --upgrade --quiet pip setuptools wheel packaging
+  py_install --upgrade --quiet setuptools wheel packaging
 fi
 
 echo
