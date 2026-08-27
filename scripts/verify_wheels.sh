@@ -447,34 +447,35 @@ stage_import() {
 #
 # One real op per native package, on the GPU. This is the stage that catches a
 # PTX-only build failing to JIT for the device, which no import can tell you.
+#
+# It is also the stage most likely to be killed rather than to raise. These
+# extensions check cudaGetLastError() from C and several of them answer a
+# failure with exit(-1) -- pointgroup_ops does, in bfs_cluster_kernel.cu -- so
+# on a device the cubins were not built for, the first such package takes the
+# interpreter down with it and every check after that one silently never runs.
+# The runner below therefore treats the interpreter as expendable: it reads the
+# verdicts off stdout as they are produced and starts again on whatever is
+# left, so a package that aborts costs one result rather than the rest of the
+# stage.
 # ------------------------------------------------------------------------------
 stage_kernel() {
   c_log "stage kernel: one op per native package"
-  "${PY}" - <<'PYEOF'
+
+  if ! "${PY}" -c 'import sys, torch; sys.exit(0 if torch.cuda.is_available() else 1)'; then
+    echo "  no CUDA device visible; nothing to launch"
+    return 0
+  fi
+
+  # A file rather than a heredoc on stdin, because the runner has to be able to
+  # start it again with a shorter list of checks.
+  local src; src="$(mktemp -t pointcept-kernel-XXXXXX.py)"
+  cat > "${src}" <<'PYEOF'
+import sys
 import traceback
 
 import torch
 
-if not torch.cuda.is_available():
-    print("  no CUDA device visible; nothing to launch")
-    raise SystemExit(0)
-
 dev = torch.device("cuda")
-failures = []
-
-
-def check(name, fn):
-    try:
-        fn()
-        torch.cuda.synchronize()
-    except Exception:
-        failures.append(name)
-        print(f"  FAIL {name}")
-        for line in traceback.format_exc().strip().splitlines()[-4:]:
-            print(f"       {line}")
-    else:
-        print(f"  ok   {name}")
-
 
 N = 4096
 xyz = torch.rand(N, 3, device=dev).contiguous()
@@ -613,28 +614,90 @@ def t_swin3d():
     assert idx.shape == (N, 8), idx.shape
 
 
-for name, fn in [
-    ("pointops", t_pointops),
-    ("pointops2", t_pointops2),
-    ("pointgroup_ops", t_pointgroup_ops),
-    ("pointrope", t_pointrope),
-    ("pointseg", t_pointseg),
-    ("spconv", t_spconv),
-    ("torch_scatter", t_torch_scatter),
-    ("torch_cluster", t_torch_cluster),
-    ("torch_sparse", t_torch_sparse),
-    ("torch_geometric", t_torch_geometric),
-    ("Swin3D", t_swin3d),
-]:
-    check(name, fn)
+CHECKS = {
+    "pointops": t_pointops,
+    "pointops2": t_pointops2,
+    "pointgroup_ops": t_pointgroup_ops,
+    "pointrope": t_pointrope,
+    "pointseg": t_pointseg,
+    "spconv": t_spconv,
+    "torch_scatter": t_torch_scatter,
+    "torch_cluster": t_torch_cluster,
+    "torch_sparse": t_torch_sparse,
+    "torch_geometric": t_torch_geometric,
+    "Swin3D": t_swin3d,
+}
 
 # ocnn and torch_geometric ship as py3-none-any: there is no compiled artifact
 # of their own to launch, so importing them (the stage above) is the whole
 # check. torch_geometric still appears here because voxel_grid calls into
 # torch_cluster, which is compiled.
 
-raise SystemExit(1 if failures else 0)
+# One flushed line per verdict. stdout is a pipe here, so it is block-buffered,
+# and a C-level exit(-1) inside an extension runs through nothing that would
+# empty a Python buffer -- without flush, every result of a run would leave
+# with the process that died halfway through it.
+for name in sys.argv[1:]:
+    try:
+        CHECKS[name]()
+        torch.cuda.synchronize()
+    except Exception:
+        print(f"@@ {name} fail", flush=True)
+        for line in traceback.format_exc().strip().splitlines()[-4:]:
+            print(f"| {line}", flush=True)
+    else:
+        print(f"@@ {name} ok", flush=True)
 PYEOF
+
+  local -a pending=(
+    pointops pointops2 pointgroup_ops pointrope pointseg spconv
+    torch_scatter torch_cluster torch_sparse torch_geometric Swin3D
+  )
+  local rc=0 out line name status
+  while [[ ${#pending[@]} -gt 0 ]]; do
+    # Not `|| return`: a run that ends in a crash still carries the verdicts of
+    # everything it got through, and reading those back is the whole point.
+    out="$("${PY}" "${src}" "${pending[@]}" 2>&1)" || true
+
+    local -a reported=() noise=() rest=()
+    # A here-string, not a pipe: the loop has to leave rc and reported behind.
+    while IFS= read -r line; do
+      case "${line}" in
+        "@@ "*)
+          read -r _ name status <<<"${line}"
+          reported+=("${name}")
+          if [[ "${status}" == "ok" ]]; then
+            c_ok "${name}"
+          else
+            c_fail "${name}"
+            rc=1
+          fi
+          ;;
+        "| "*) echo "       ${line#| }" ;;
+        # Anything else is the dying extension's own last words on stderr.
+        *)     noise+=("${line}") ;;
+      esac
+    done <<<"${out}"
+
+    for name in "${pending[@]}"; do
+      [[ " ${reported[*]} " == *" ${name} "* ]] || rest+=("${name}")
+    done
+    if [[ ${#rest[@]} -eq 0 ]]; then
+      pending=()
+      continue
+    fi
+    # The interpreter stopped, so the first check with no verdict is the one
+    # that stopped it. Charge the failure to that package and resume after it.
+    c_fail "${rest[0]} (aborted the interpreter)"
+    rc=1
+    if [[ ${#noise[@]} -gt 0 ]]; then
+      printf '%s\n' "${noise[@]}" | tail -4 | sed 's/^/       /'
+    fi
+    pending=("${rest[@]:1}")
+  done
+
+  rm -f "${src}"
+  return "${rc}"
 }
 
 # ------------------------------------------------------------------------------
