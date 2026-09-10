@@ -1910,28 +1910,50 @@ pkg_torch_geometric() {
 #
 # The mapping below is not a filter: an sm_80 cubin also runs on sm_86/87/89,
 # because cubins stay binary compatible across a major compute revision. The
-# Blackwell entries are the exception, which is why 10.3 and 12.1 map to
-# nothing -- upstream torch keeps them as separate targets (see named_arches in
-# torch/utils/cpp_extension.py), so an sm_100/sm_120 cubin does not cover them.
+# Blackwell entries are the exception -- upstream torch keeps 10.3 and 12.1 as
+# separate targets (see named_arches in torch/utils/cpp_extension.py), so an
+# sm_100/sm_120 cubin does not cover them.
+#
+# They are still reachable, by the same route cumm takes (see cumm_arch_for):
+# ask for the family's PTX alongside the cubin and let the driver JIT it on
+# first load. upstream's gencode carries no PTX, and FLASH_ATTN_CUDA_ARCHS
+# cannot add one -- but nvcc reads NVCC_APPEND_FLAGS itself, so the extra
+# gencode goes in without patching setup.py. Marked "+PTX" here; the caller
+# splits the two apart.
 flash_attn_arch_for() {
   case "$1" in
-    8.0|8.6|8.7|8.9) echo "80"  ;;
-    9.0)             echo "90"  ;;
-    10.0)            echo "100" ;;
-    12.0)            echo "120" ;;
-    *)               echo ""    ;;
+    8.0|8.6|8.7|8.9) echo "80"      ;;
+    9.0)             echo "90"      ;;
+    10.0)            echo "100"     ;;
+    12.0)            echo "120"     ;;
+    10.3)            echo "100+PTX" ;;
+    12.1)            echo "120+PTX" ;;
+    *)               echo ""        ;;
   esac
 }
 
+# Echoes "<cubin list>|<extra nvcc flags>": the first half is what flash-attn's
+# own FLASH_ATTN_CUDA_ARCHS takes, the second is the PTX gencodes nvcc needs on
+# top of it. Either half can be empty.
 flash_attn_archs() {
-  local -a out=()
-  local a code
+  local -a out=() ptx=()
+  local a mapped code
   for a in ${TORCH_CUDA_ARCH_LIST:-}; do
-    code="$(flash_attn_arch_for "${a%%+*}")"
-    [[ -n "${code}" ]] || continue
+    mapped="$(flash_attn_arch_for "${a%%+*}")"
+    [[ -n "${mapped}" ]] || continue
+    code="${mapped%+PTX}"
     [[ " ${out[*]} " == *" ${code} "* ]] || out+=("${code}")
+    # PTX whenever the mapping had to move families, or the caller asked for it.
+    if [[ "${mapped}" == *+PTX || "${a}" == *+PTX ]]; then
+      [[ " ${ptx[*]} " == *" ${code} "* ]] || ptx+=("${code}")
+    fi
   done
-  (IFS=';'; echo "${out[*]}")
+
+  local flags=""
+  for code in ${ptx[*]+"${ptx[@]}"}; do
+    flags+="${flags:+ }-gencode arch=compute_${code},code=compute_${code}"
+  done
+  echo "$( (IFS=';'; echo "${out[*]}") )|${flags}"
 }
 
 pkg_flash_attn() {
@@ -1941,7 +1963,9 @@ pkg_flash_attn() {
     return 0
   fi
 
-  local archs; archs="$(flash_attn_archs)"
+  local mapped archs flags
+  mapped="$(flash_attn_archs)"
+  archs="${mapped%%|*}"; flags="${mapped#*|}"
   if [[ -z "${archs}" ]]; then
     c_warn "flash-attn skipped: no target in '${TORCH_CUDA_ARCH_LIST:-}' has flash-attn 2.x kernels"
     c_warn "  it supports sm_80/90/100/120 only; Turing, Orin-only and Thor builds have nothing to compile"
@@ -1950,11 +1974,21 @@ pkg_flash_attn() {
   fi
   c_log "flash-attn arch set: ${archs} (from ${TORCH_CUDA_ARCH_LIST})"
 
+  local -a extra=()
+  if [[ -n "${flags}" ]]; then
+    # The cubin alone would not load on this device; the JIT of this PTX is what
+    # does. Announced, because the first attention call then pays for it.
+    c_log "flash-attn PTX: ${flags}"
+    record "# flash-attn built with PTX for a Blackwell family target"
+    extra+=("NVCC_APPEND_FLAGS=${flags}")
+  fi
+
   # PyPI carries an sdist only, so this always compiles. It is by far the
   # longest step; MAX_JOBS and the arch set above are what keep it bounded.
   build_wheel "flash-attn" "git+https://github.com/Dao-AILab/flash-attention.git@v2.8.3.post1" \
     "FLASH_ATTENTION_FORCE_BUILD=TRUE" \
-    "FLASH_ATTN_CUDA_ARCHS=${archs}"
+    "FLASH_ATTN_CUDA_ARCHS=${archs}" \
+    ${extra[*]+"${extra[@]}"}
 }
 
 pkg_ocnn() {
