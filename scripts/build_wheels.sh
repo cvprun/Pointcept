@@ -356,6 +356,8 @@ ${C_BOLD}BUILD TUNING${C_RESET}
   --no-cache         Disable the shared build cache (downloads AND the venv;
                      every run then reprovisions torch from scratch)
   --keep-going       Continue to the next combination after a failure
+  -y, --yes          Skip the confirmation prompt 'build' shows after the
+                     matrix preview (also assumed when stdin is not a tty)
   --dry-run          Print what would run without executing it
   -v, --verbose      Verbose logging (also streams compiler output)
   -h, --help         Show this message
@@ -406,6 +408,10 @@ ${C_BOLD}NOTES${C_RESET}
     appended to rather than rewritten. 'clean' drops both.
   * Wheels land in <out>/linux-<arch>/<accel>/torch<ver>-cp<py>/ with a
     manifest.txt recording how each wheel was obtained.
+  * 'build' first prints the same preview as 'matrix' (combinations, packages,
+    output directory) and asks for confirmation before any container starts.
+    Pass -y/--yes to skip the question; a non-interactive stdin (CI, cron)
+    skips it too so existing automation keeps working.
   * 'build' checks the host driver and GPU against each CUDA target and warns
     when the wheels would not load here. No GPU is needed to build them, so the
     check never blocks; it is there for when you are building for this machine.
@@ -433,6 +439,7 @@ ENGINE_REQUESTED="${PC_ENGINE:-}"
 DOCKER_HOST_OVERRIDE=""
 USE_CACHE="1"
 KEEP_GOING="0"
+ASSUME_YES="0"
 DRY_RUN="0"
 VERBOSE="0"
 IN_CONTAINER="0"
@@ -472,6 +479,7 @@ parse_args() {
                        DOCKER_HOST_OVERRIDE="$2"; shift 2 ;;
       --no-cache)      USE_CACHE="0";             shift   ;;
       --keep-going)    KEEP_GOING="1";            shift   ;;
+      -y|--yes)        ASSUME_YES="1";            shift   ;;
       --dry-run)       DRY_RUN="1";               shift   ;;
       -v|--verbose)    VERBOSE="1";               shift   ;;
       -h|--help)       usage; exit 0 ;;
@@ -829,11 +837,12 @@ qemu_available_for() {
   esac
 }
 
-cmd_matrix() {
-  local combos; combos="$(expand_matrix)"
-  [[ -n "${combos}" ]] || die "matrix is empty after validation"
-
-  local -a pkgs; mapfile -t pkgs < <(selected_packages)
+# Print the plan: every combination that survived validation, the packages in
+# build order and where the wheels go. Shared by `matrix` (which prints only
+# this) and `build` (which prints it and then asks before starting).
+print_plan() {
+  local combos="$1"; shift
+  local -a pkgs=("$@")
   local n; n="$(echo "${combos}" | wc -l)"
 
   echo
@@ -871,6 +880,36 @@ cmd_matrix() {
       warn "linux/${a} needs QEMU: run '${SCRIPT_NAME} setup-qemu' or pass --docker-host <native ${a} host>"
     fi
   done
+}
+
+cmd_matrix() {
+  local combos; combos="$(expand_matrix)"
+  [[ -n "${combos}" ]] || die "matrix is empty after validation"
+
+  local -a pkgs; mapfile -t pkgs < <(selected_packages)
+  print_plan "${combos}" "${pkgs[@]}"
+}
+
+# Ask before spending hours of nvcc time on the plan just printed. Returns 0 to
+# go ahead, 1 to stop. Skipped with --yes, under --dry-run (nothing runs anyway)
+# and when stdin is not a terminal, so CI and cron invocations are unaffected.
+confirm_build() {
+  local total="$1" npkgs="$2"
+  if [[ "${ASSUME_YES}" == "1" || "${DRY_RUN}" == "1" ]]; then
+    return 0
+  fi
+  if [[ ! -t 0 ]]; then
+    debug "stdin is not a tty; skipping the build confirmation"
+    return 0
+  fi
+
+  local reply
+  printf '%s' "${C_BOLD}Build ${total} combination(s) x ${npkgs} package(s)? [y/N] ${C_RESET}" >&2
+  IFS= read -r reply || reply=""
+  case "${reply}" in
+    y|Y|yes|YES|Yes) return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
 cmd_clean() {
@@ -1134,6 +1173,12 @@ cmd_build() {
   local index=0 failed=0
   local -a failures=()
   local -a produced=()
+
+  print_plan "${combos}" "${pkgs[@]}"
+  if ! confirm_build "${total}" "${#pkgs[@]}"; then
+    warn "aborted before building; nothing was run"
+    return 1
+  fi
 
   log "building ${total} combination(s) x ${#pkgs[@]} package(s)"
 
