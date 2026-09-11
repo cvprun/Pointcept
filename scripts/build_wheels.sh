@@ -348,6 +348,10 @@ ${C_BOLD}BUILD TUNING${C_RESET}
                       sm_80/90/100/120 every time)
   --rocm-arch LIST   Override PYTORCH_ROCM_ARCH, e.g. "gfx90a;gfx942"
   --jobs      N      Parallel compile jobs (MAX_JOBS)      [nproc, capped at 16]
+                     A CPU ceiling: each package lowers it further to what the
+                     free memory allows (see build_jobs_for in the script)
+  --memory    GB     Hard memory cap on the build container   [host RAM - 4 GB]
+                     0 disables; unset when building on a --remote-host
   --out       DIR    Output directory                              [wheelhouse]
   --engine    NAME   Container engine: docker | podman | nerdctl
                      [auto-detect, in that order; env PC_ENGINE]
@@ -434,6 +438,7 @@ ONLY=""; SKIP=""
 FORCE_SOURCE="0"
 CUDA_ARCH_OVERRIDE=""; ROCM_ARCH_OVERRIDE=""
 JOBS=""
+MEMORY_GB=""
 OUT_DIR="${REPO_ROOT}/wheelhouse"
 ENGINE_REQUESTED="${PC_ENGINE:-}"
 DOCKER_HOST_OVERRIDE=""
@@ -472,6 +477,7 @@ parse_args() {
       --cuda-arch)     CUDA_ARCH_OVERRIDE="$2";   shift 2 ;;
       --rocm-arch)     ROCM_ARCH_OVERRIDE="$2";   shift 2 ;;
       --jobs|-j)       JOBS="$2";                 shift 2 ;;
+      --memory)        MEMORY_GB="$2";            shift 2 ;;
       --out)           OUT_DIR="$2";              shift 2 ;;
       --engine)        ENGINE_REQUESTED="$2";     shift 2 ;;
       # --docker-host is the historical spelling of --remote-host.
@@ -948,6 +954,15 @@ engine_run_args() {
   args+=(-e "PC_TORCH=${torch}" -e "PC_PYTHON=${python}")
   args+=(-e "PC_FORCE_SOURCE=${FORCE_SOURCE}" -e "PC_VERBOSE=${VERBOSE}")
   args+=(-e "PC_JOBS=${JOBS:-$(default_jobs)}")
+
+  # A hard ceiling, swap included, so a compile that outgrows the host takes
+  # down one nvcc inside the container (pip fails, the package is recorded as
+  # failed) rather than the host: without it a runaway build sends the whole
+  # machine into swap and everything on it stops responding.
+  local mem; mem="$(default_memory_gb)"
+  if [[ -n "${mem}" && "${mem}" != "0" ]]; then
+    args+=(--memory "${mem}g" --memory-swap "${mem}g")
+  fi
   args+=(-e "PC_TORCH_ACCEL=$(torch_index_accel "${accel}")")
   args+=(-e "PC_TORCH_INDEX=$(torch_index_url "$(torch_index_accel "${accel}")")")
 
@@ -992,9 +1007,25 @@ engine_run_args() {
 
 default_jobs() {
   local n; n="$(nproc 2>/dev/null || echo 4)"
-  # nvcc peaks around 2.5 GB per job; cap so a big machine does not OOM.
+  # This is only the CPU side of the budget. Memory is the binding constraint
+  # for the CUDA packages, and it differs per package (flash-attn needs several
+  # times what a torch extension does), so it is applied inside the container,
+  # per package, by build_jobs_for.
   [[ "${n}" -gt 16 ]] && n=16
   echo "${n}"
+}
+
+# The --memory default: the host's RAM minus headroom for the OS, the engine
+# and whatever else is running. Only meaningful for a local daemon; a remote
+# host has its own RAM, and its own way to be told about it.
+default_memory_gb() {
+  if [[ -n "${MEMORY_GB}" ]]; then echo "${MEMORY_GB}"; return; fi
+  [[ -z "${DOCKER_HOST_OVERRIDE}" ]] || { echo 0; return; }
+  local kb; kb="$(awk '/^MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null || true)"
+  [[ -n "${kb}" ]] || { echo 0; return; }
+  local gb=$(( kb / 1024 / 1024 - 4 ))
+  [[ "${gb}" -lt 8 ]] && gb=8
+  echo "${gb}"
 }
 
 # ==============================================================================
@@ -1565,12 +1596,83 @@ try_prebuilt() {
   return 1
 }
 
+# Memory the build may use, in whole GB: the smaller of what the kernel reports
+# free and what the container's cgroup still allows (docker --memory shows up
+# there, never in /proc/meminfo).
+build_available_gb() {
+  local kb; kb="$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
+  local avail=$(( kb / 1024 / 1024 ))
+  local max cur f
+  for f in /sys/fs/cgroup/memory.max; do
+    [[ -r "${f}" ]] || continue
+    max="$(cat "${f}")"; cur="$(cat /sys/fs/cgroup/memory.current 2>/dev/null || echo 0)"
+    [[ "${max}" =~ ^[0-9]+$ ]] || continue
+    local room=$(( (max - cur) / 1024 / 1024 / 1024 ))
+    [[ "${room}" -lt "${avail}" ]] && avail="${room}"
+  done
+  echo "${avail}"
+}
+
+# How many compile jobs this package gets: PC_JOBS, lowered until the peak
+# memory of that many jobs fits in what is free. `per_job_gb` is the package's
+# own peak per job; every nvcc invocation is one job, and flash-attn's are far
+# heavier than anyone else's (see pkg_flash_attn). Never below 1: a build that
+# cannot fit one job should fail loudly rather than be skipped.
+build_jobs_for() {
+  local per_job_gb="$1"
+  local jobs="${PC_JOBS}" avail; avail="$(build_available_gb)"
+  local fit=$(( avail / per_job_gb ))
+  [[ "${fit}" -lt "${jobs}" ]] && jobs="${fit}"
+  [[ "${jobs}" -lt 1 ]] && jobs=1
+  echo "${jobs} ${avail}"
+}
+
+# ccimport -- the builder behind pccm, hence cumm and spconv -- runs `ninja`
+# with no -j at all, so ninja falls back to nproc+2 and MAX_JOBS never reaches
+# it. torch's cpp_extension passes -j explicitly. A shim ahead of the real
+# ninja on PATH adds -j from PC_NINJA_JOBS whenever the caller did not, which
+# is exactly the ccimport case, and leaves an explicit -j alone.
+container_install_ninja_shim() {
+  local dir="/opt/pc-shim"
+  mkdir -p "${dir}"
+  cat > "${dir}/ninja" <<'SHIM'
+#!/usr/bin/env bash
+# Installed by build_wheels.sh: forwards to the next `ninja` on PATH, adding
+# -j "${PC_NINJA_JOBS}" when the caller passed none.
+self="$(readlink -f "$0")"
+real=""
+IFS=: read -r -a dirs <<< "${PATH}"
+for d in "${dirs[@]}"; do
+  c="${d}/ninja"
+  [[ -x "${c}" && "$(readlink -f "${c}")" != "${self}" ]] || continue
+  real="${c}"; break
+done
+[[ -n "${real}" ]] || { echo "ninja shim: no real ninja on PATH" >&2; exit 127; }
+for a in "$@"; do
+  case "${a}" in -j*) exec "${real}" "$@" ;; esac
+done
+if [[ -n "${PC_NINJA_JOBS:-}" ]]; then
+  exec "${real}" -j "${PC_NINJA_JOBS}" "$@"
+fi
+exec "${real}" "$@"
+SHIM
+  chmod +x "${dir}/ninja"
+  export PATH="${dir}:${PATH}"
+}
+
 # Build a wheel from a source tree or a VCS/sdist spec into /out.
+#
+# BUILD_JOB_GB (a plain shell variable, set per call as `BUILD_JOB_GB=9
+# build_wheel ...`) is the package's peak memory per compile job; the default
+# covers a torch CUDA extension compiled for a handful of arches.
 build_wheel() {
   local label="$1" src="$2"; shift 2
   local -a env_pairs=("$@")
 
+  local jobs avail
+  read -r jobs avail <<< "$(build_jobs_for "${BUILD_JOB_GB:-3}")"
   c_log "compiling ${label} (this is the slow path)"
+  c_log "  jobs=${jobs} (cap ${PC_JOBS}, ~${BUILD_JOB_GB:-3} GB/job, ${avail} GB available)"
 
   # pip builds into a staging directory, not straight into /out. /out is not
   # empty on a second run -- `--only spconv` rebuilds cumm by design, and any
@@ -1582,7 +1684,7 @@ build_wheel() {
   # this build's output, and it is moved into /out afterwards.
   local stage; stage="$(mktemp -d)"
 
-  local -a cmd=(env "MAX_JOBS=${PC_JOBS}")
+  local -a cmd=(env "MAX_JOBS=${jobs}" "PC_NINJA_JOBS=${jobs}")
   [[ -n "${TORCH_CUDA_ARCH_LIST:-}" ]] && cmd+=("TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST}")
   [[ -n "${PYTORCH_ROCM_ARCH:-}"    ]] && cmd+=("PYTORCH_ROCM_ARCH=${PYTORCH_ROCM_ARCH}")
   local kv
@@ -2029,10 +2131,17 @@ pkg_flash_attn() {
   fi
 
   # PyPI carries an sdist only, so this always compiles. It is by far the
-  # longest step; MAX_JOBS and the arch set above are what keep it bounded.
+  # longest step, and the one that can take a machine down: upstream's setup.py
+  # hands every nvcc `--threads 4` (NVCC_THREADS), so one MAX_JOBS job is four
+  # compiler processes, and upstream measures the peak at 8-9 GB per job. Its
+  # own setup.py would size MAX_JOBS from free memory -- but only when MAX_JOBS
+  # is unset, and build_wheel always sets it. So the same arithmetic is done
+  # here: 9 GB per job, against the memory the container actually has.
+  BUILD_JOB_GB=9 \
   build_wheel "flash-attn" "git+https://github.com/Dao-AILab/flash-attention.git@v2.8.3.post1" \
     "FLASH_ATTENTION_FORCE_BUILD=TRUE" \
     "FLASH_ATTN_CUDA_ARCHS=${archs}" \
+    "NVCC_THREADS=4" \
     ${extra[*]+"${extra[@]}"}
 }
 
@@ -2113,6 +2222,7 @@ run_in_container() {
   container_prepare_system
   container_prepare_python
   container_install_torch
+  container_install_ninja_shim
 
   local failed=0 pkg
   for pkg in $(split_list "${PKG_LIST}"); do
