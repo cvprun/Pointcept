@@ -230,8 +230,9 @@ If you find _Pointcept_ useful to your research, please cite our work as encoura
   works on amd64 and arm64.
 
   ```bash
-  # Wheels for the GPU in this machine: its CPU architecture, a CUDA toolkit
-  # that covers the part, and that part's compute capability as the only arch
+  # Wheels for the GPU in this machine: its CPU architecture, the newest CUDA
+  # toolkit its driver runs that torch ships for, and that part's compute
+  # capability as the only arch
   ./scripts/build_wheels.sh build
 
   # Inspect a release matrix before spending nvcc time on it

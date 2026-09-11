@@ -373,8 +373,9 @@ ${C_BOLD}PRESETS${C_RESET}
   ci        amd64, cu128, torch ${DEFAULT_TORCH}, py ${DEFAULT_PYTHON}, local libs only
 
   With no preset the target is the machine the script runs on: its CPU
-  architecture, a CUDA toolkit that covers its GPU, and that GPU's compute
-  capability as the only device arch. A host whose GPU cannot be read (no
+  architecture, the newest CUDA toolkit its driver can run that torch ships
+  for and that covers its GPU, and that GPU's compute capability as the
+  only device arch. A host whose GPU cannot be read (no
   NVIDIA driver, a --remote-host, an --arch other than its own) has no
   such target; the build then stops and asks for --accel and --cuda-arch
   (or --rocm-arch) rather than guess.
@@ -569,7 +570,8 @@ resolve_host_target() {
   if [[ -z "${ACCEL_LIST}" ]]; then
     [[ -n "${caps}" ]] || die_no_host_target "${why}" "--accel"
     ACCEL_LIST="$(accel_for_host_gpu cu128 "${TORCH_LIST%%,*}")"
-    TARGET_NOTE="accel ${ACCEL_LIST} chosen for this host's GPU (compute ${caps})"
+    local dc; dc="$(host_driver_cuda || true)"
+    TARGET_NOTE="accel ${ACCEL_LIST} chosen for this host's GPU (compute ${caps}${dc:+, driver runs CUDA ${dc}}, torch ${TORCH_LIST%%,*})"
   fi
 
   local accel kind
@@ -1168,23 +1170,42 @@ accel_covers_caps() {
   done
 }
 
-# Which toolkit a build for this host should use. The given default wins
-# whenever it can emit code for every GPU here, so the common case keeps the
-# toolkit it always used; only a part that default cannot reach moves the choice,
-# and then to the newest toolkit that covers it, because the newest CUDA line is
-# the one torch builds wheels for such a part against. Candidates are limited to
-# tokens with a PyTorch index of their own and wheels for this torch version.
+# The newest CUDA release the host driver can run, as "major.minor", read off
+# nvidia-smi's banner ("CUDA Version: 13.1"). Empty when there is no driver or
+# the banner has no such field.
+host_driver_cuda() {
+  command -v nvidia-smi >/dev/null 2>&1 || return 1
+  local v; v="$(nvidia-smi 2>/dev/null | grep -oE 'CUDA Version: *[0-9]+\.[0-9]+' | head -1 | grep -oE '[0-9]+\.[0-9]+')"
+  [[ -n "${v}" ]] || return 1
+  echo "${v}"
+}
+
+# Which toolkit a build for this host should use: the newest one the host
+# driver can run, among those PyTorch publishes an index for at this torch
+# version, that can emit code for every GPU here. A driver is the one part of
+# the stack the user does not choose per build, and it caps the runtime: a
+# driver reporting CUDA 13.1 runs cu130 wheels and cu128 wheels alike, so
+# picking the older line for it would trade away kernels for nothing. Only
+# when the driver's ceiling cannot be read does the given default win, and
+# then only if it covers the GPU.
 accel_for_host_gpu() {
   local fallback="$1" torch="$2"
   local caps; caps="$(host_gpu_caps)" || { echo "${fallback}"; return 0; }
-  accel_covers_caps "${fallback}" "${caps}" && { echo "${fallback}"; return 0; }
+  local driver_cuda; driver_cuda="$(host_driver_cuda || true)"
+  if [[ -z "${driver_cuda}" ]] && accel_covers_caps "${fallback}" "${caps}"; then
+    echo "${fallback}"; return 0
+  fi
 
-  local i accel min_torch
+  local i accel min_torch full
   for (( i = ${#KNOWN_CUDA_ACCELS[@]} - 1; i >= 0; i-- )); do
     accel="${KNOWN_CUDA_ACCELS[i]}"
     [[ "$(torch_index_accel "${accel}")" == "${accel}" ]] || continue
     min_torch="$(cuda_min_torch "${accel}")"
     [[ -n "${min_torch}" ]] && version_ge "${torch}" "${min_torch}" || continue
+    if [[ -n "${driver_cuda}" ]]; then
+      full="$(cuda_full_version "${accel}")"; full="${full%.*}"
+      version_ge "${driver_cuda}" "${full}" || continue
+    fi
     accel_covers_caps "${accel}" "${caps}" && { echo "${accel}"; return 0; }
   done
 
