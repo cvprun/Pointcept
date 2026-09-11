@@ -230,7 +230,11 @@ If you find _Pointcept_ useful to your research, please cite our work as encoura
   works on amd64 and arm64.
 
   ```bash
-  # Inspect the matrix before spending nvcc time on it
+  # Wheels for the GPU in this machine: its CPU architecture, a CUDA toolkit
+  # that covers the part, and that part's compute capability as the only arch
+  ./scripts/build_wheels.sh build
+
+  # Inspect a release matrix before spending nvcc time on it
   ./scripts/build_wheels.sh matrix --preset default
 
   # amd64 + arm64, CUDA 12.8, torch 2.9.1, CPython 3.12
@@ -239,12 +243,18 @@ If you find _Pointcept_ useful to your research, please cite our work as encoura
   # A single target, with the device code trimmed to one architecture
   ./scripts/build_wheels.sh build --arch arm64 --accel cu128 --cuda-arch "9.0"
 
-  # CUDA 13 (Thor, DGX Spark, Blackwell)
-  ./scripts/build_wheels.sh build --arch arm64 --accel cu130 --torch 2.9.1
+  # CUDA 13 (Thor, DGX Spark)
+  ./scripts/build_wheels.sh build --arch arm64 --accel cu130 --cuda-arch "11.0 12.1" --torch 2.9.1
 
   # AMD GPUs
   ./scripts/build_wheels.sh build --arch amd64 --accel rocm6.4 --rocm-arch "gfx90a;gfx942"
   ```
+
+  Without a preset the script builds for the machine it runs on and reads the target from its GPU.
+  When that GPU cannot be read (no NVIDIA driver, a `--remote-host`, an `--arch` other than the
+  host's own) there is no target to infer, and the build stops and asks for `--accel` plus
+  `--cuda-arch` (or `--rocm-arch`) instead of falling back to a default that may not match the
+  hardware. The presets are fixed matrices and never consult the host.
 
   Accelerator tokens run from `cu118` through `cu132`, plus `rocm6.3`/`rocm6.4` and `cpu`. Each CUDA
   release has a torch floor — `cu130` needs 2.9.0, `cu132` needs 2.12.0 — and pairings below it are

@@ -16,9 +16,10 @@
 # container (see `--in-container`), so there is exactly one file to maintain.
 #
 # Quick start
-#   ./scripts/build_wheels.sh matrix --preset default     # show what would run
+#   ./scripts/build_wheels.sh build                       # wheels for this machine's GPU
+#   ./scripts/build_wheels.sh matrix --preset default     # show a release matrix
 #   ./scripts/build_wheels.sh build --preset default      # build it
-#   ./scripts/build_wheels.sh build --arch arm64 --accel cu128 --torch 2.9.1
+#   ./scripts/build_wheels.sh build --arch arm64 --accel cu128 --cuda-arch "9.0"
 #
 # Author: Pointcept contributors
 # ==============================================================================
@@ -49,8 +50,6 @@ ENGINE_ROOTLESS="0"
 # Defaults
 # ------------------------------------------------------------------------------
 DEFAULT_OS="ubuntu24.04"
-DEFAULT_ARCH="amd64"
-DEFAULT_ACCEL="cu128"
 DEFAULT_TORCH="2.9.1"
 DEFAULT_PYTHON="3.12"
 
@@ -327,13 +326,13 @@ ${C_BOLD}COMMANDS${C_RESET}
 
 ${C_BOLD}MATRIX AXES${C_RESET} (comma separated; the cartesian product is built)
   --os        LIST   ubuntu24.04, ubuntu22.04            [${DEFAULT_OS}]
-  --arch      LIST   amd64, arm64                        [${DEFAULT_ARCH}]
+  --arch      LIST   amd64, arm64                        [this machine]
   --accel     LIST   cu118 cu121 cu124 cu126 cu128 cu129
                      cu130 cu131 cu132 rocm6.3 rocm6.4
-                     cpu                                 [${DEFAULT_ACCEL}]
+                     cpu                                 [from this GPU]
   --torch     LIST   PyTorch versions, e.g. 2.8.0,2.9.1   [${DEFAULT_TORCH}]
   --python    LIST   CPython versions, e.g. 3.11,3.12     [${DEFAULT_PYTHON}]
-  --preset    NAME   default | full | arm64 | ci | local
+  --preset    NAME   default | full | arm64 | ci
 
 ${C_BOLD}PACKAGE SELECTION${C_RESET}
   --only      LIST   Build only these packages
@@ -343,14 +342,15 @@ ${C_BOLD}PACKAGE SELECTION${C_RESET}
   --prefer-prebuilt  Reuse prebuilt wheels when available          [default]
 
 ${C_BOLD}BUILD TUNING${C_RESET}
-  --cuda-arch LIST   Override TORCH_CUDA_ARCH_LIST, e.g. "8.9 9.0"
+  --cuda-arch LIST   TORCH_CUDA_ARCH_LIST, e.g. "8.9 9.0"      [from this GPU]
                      (also narrows flash-attn, which otherwise builds
                       sm_80/90/100/120 every time)
   --rocm-arch LIST   Override PYTORCH_ROCM_ARCH, e.g. "gfx90a;gfx942"
   --jobs      N      Parallel compile jobs (MAX_JOBS)      [nproc, capped at 16]
                      A CPU ceiling: each package lowers it further to what the
                      free memory allows (see build_jobs_for in the script)
-  --memory    GB     Hard memory cap on the build container   [host RAM - 4 GB]
+  --memory    GB     Hard memory cap on the build container
+                     [what is free on the host right now, minus 6 GB]
                      0 disables; unset when building on a --remote-host
   --out       DIR    Output directory                              [wheelhouse]
   --engine    NAME   Container engine: docker | podman | nerdctl
@@ -371,7 +371,13 @@ ${C_BOLD}PRESETS${C_RESET}
   full      amd64+arm64 x cu126,cu128,cu130 x torch 2.8.0,2.9.1 x py 3.11,3.12
   arm64     arm64 only, cu126+cu128 (the source-build heavy path)
   ci        amd64, cu128, torch ${DEFAULT_TORCH}, py ${DEFAULT_PYTHON}, local libs only
-  local     Host arch, cu128, local libs only (fastest sanity check)
+
+  With no preset the target is the machine the script runs on: its CPU
+  architecture, a CUDA toolkit that covers its GPU, and that GPU's compute
+  capability as the only device arch. A host whose GPU cannot be read (no
+  NVIDIA driver, a --remote-host, an --arch other than its own) has no
+  such target; the build then stops and asks for --accel and --cuda-arch
+  (or --rocm-arch) rather than guess.
 
 ${C_BOLD}EXAMPLES${C_RESET}
   # See the plan before spending an hour of nvcc time
@@ -381,7 +387,7 @@ ${C_BOLD}EXAMPLES${C_RESET}
   ${SCRIPT_NAME} build --arch arm64 --accel cu128 --cuda-arch "9.0"
 
   # Native arm64 build over SSH instead of QEMU (much faster)
-  ${SCRIPT_NAME} build --arch arm64 --remote-host ssh://gh200-node
+  ${SCRIPT_NAME} build --arch arm64 --accel cu128 --cuda-arch "9.0" --remote-host ssh://gh200-node
 
   # No docker on this box? podman works the same way
   ${SCRIPT_NAME} build --engine podman --preset default
@@ -419,9 +425,9 @@ ${C_BOLD}NOTES${C_RESET}
   * 'build' checks the host driver and GPU against each CUDA target and warns
     when the wheels would not load here. No GPU is needed to build them, so the
     check never blocks; it is there for when you are building for this machine.
-  * --preset local reads this machine's GPU and picks both the CUDA toolkit and
-    the arch list from it, so it builds the smallest set of wheels that runs
-    here. Any explicit --accel / --cuda-arch still wins.
+  * Without a preset the build reads this machine's GPU and picks both the CUDA
+    toolkit and the arch list from it, so it builds the smallest set of wheels
+    that runs here. Any explicit --arch / --accel / --cuda-arch still wins.
   * A --cuda-arch (or default) target the chosen nvcc cannot emit drops that
     combination during validation: CUDA 12.6 stops at sm_90, 12.8 adds sm_100
     and sm_120, sm_121 (DGX Spark) needs 12.9+, and sm_110 (Thor) needs 13.x.
@@ -519,26 +525,82 @@ apply_preset() {
       : "${TORCH_LIST:=${DEFAULT_TORCH}}"; : "${PYTHON_LIST:=${DEFAULT_PYTHON}}"
       : "${ONLY:=pointops,pointops2,pointgroup_ops,pointseg,pointrope}"
       ;;
-    # "local" means wheels that load on this machine, so the toolkit and the arch
-    # list follow the GPU that is actually in it rather than a fixed default --
-    # otherwise a host whose part the default cannot reach (a DGX Spark, say)
-    # builds a full set of wheels it cannot run. Both fall back to the usual
-    # defaults on a host with no NVIDIA driver.
-    local)
-      : "${ARCH_LIST:=$(host_arch)}"
-      : "${TORCH_LIST:=${DEFAULT_TORCH}}"; : "${PYTHON_LIST:=${DEFAULT_PYTHON}}"
-      : "${ACCEL_LIST:=$(accel_for_host_gpu cu128 "${TORCH_LIST%%,*}")}"
-      : "${CUDA_ARCH_OVERRIDE:=$(host_gpu_caps || true)}"
-      : "${ONLY:=pointops,pointops2,pointgroup_ops,pointseg,pointrope}"
-      ;;
-    *) die "unknown preset '${PRESET}' (default|full|arm64|ci|local)" ;;
+    *) die "unknown preset '${PRESET}' (default|full|arm64|ci)" ;;
   esac
 
   : "${OS_LIST:=${DEFAULT_OS}}"
-  : "${ARCH_LIST:=${DEFAULT_ARCH}}"
-  : "${ACCEL_LIST:=${DEFAULT_ACCEL}}"
   : "${TORCH_LIST:=${DEFAULT_TORCH}}"
   : "${PYTHON_LIST:=${DEFAULT_PYTHON}}"
+  [[ -n "${PRESET}" ]] || resolve_host_target
+}
+
+# Where the host-derived axes came from, for the plan preview: a build that
+# picked its own target should say so where the user can see it.
+TARGET_NOTE=""
+
+# No preset means "wheels that load on this machine". The CPU architecture,
+# the toolkit and the device arch list all follow the GPU that is actually in
+# it -- otherwise a host whose part a fixed default cannot reach (a DGX Spark,
+# say) builds a full set of wheels it cannot run, and a host with a single
+# part compiles six architectures it will never use.
+#
+# There is deliberately no fallback. When the GPU cannot be read there is no
+# target to build for, and picking one silently would hand the user wheels
+# for hardware they do not have without a word about it. The build stops and
+# says what to pass instead. Only the commands that expand the matrix care;
+# clean, setup-qemu and help run on any host.
+resolve_host_target() {
+  case "${COMMAND}" in build|matrix|image|shell) ;; *) return 0 ;; esac
+
+  local host; host="$(host_arch)"
+  : "${ARCH_LIST:=${host}}"
+
+  # The host GPU only describes the target when the build is for this very
+  # machine: same CPU architecture, local daemon.
+  local caps="" why=""
+  if [[ -n "${DOCKER_HOST_OVERRIDE}" ]]; then
+    why="the build runs on ${DOCKER_HOST_OVERRIDE}, whose GPU this script cannot see"
+  elif [[ "${ARCH_LIST}" != "${host}" ]]; then
+    why="--arch ${ARCH_LIST} is not this machine's (${host}), so its GPU says nothing about the target"
+  elif ! caps="$(host_gpu_caps)"; then
+    why="no NVIDIA GPU could be read on this host (nvidia-smi missing, or no compute_cap)"
+  fi
+
+  if [[ -z "${ACCEL_LIST}" ]]; then
+    [[ -n "${caps}" ]] || die_no_host_target "${why}" "--accel"
+    ACCEL_LIST="$(accel_for_host_gpu cu128 "${TORCH_LIST%%,*}")"
+    TARGET_NOTE="accel ${ACCEL_LIST} chosen for this host's GPU (compute ${caps})"
+  fi
+
+  local accel kind
+  for accel in $(split_list "${ACCEL_LIST}"); do
+    kind="$(accel_kind "${accel}")" || die "unknown accelerator: ${accel}"
+    case "${kind}" in
+      cuda)
+        [[ -z "${CUDA_ARCH_OVERRIDE}" ]] || continue
+        [[ -n "${caps}" ]] || die_no_host_target "${why}" "--cuda-arch"
+        CUDA_ARCH_OVERRIDE="${caps}"
+        TARGET_NOTE="${TARGET_NOTE:+${TARGET_NOTE}; }cuda arch ${caps} read from this host's GPU"
+        ;;
+      rocm)
+        [[ -n "${ROCM_ARCH_OVERRIDE}" ]] \
+          || die_no_host_target "this script cannot read AMD parts from the host" "--rocm-arch"
+        ;;
+    esac
+  done
+}
+
+die_no_host_target() {
+  local why="$1" flag="$2"
+  error "cannot pick ${flag} for you: ${why}."
+  error "Without --preset the build targets this machine, and that target could not be"
+  error "determined. Name it explicitly rather than trusting a default that may not match"
+  error "your hardware:"
+  error "  --accel cu128 --cuda-arch \"8.9\"          # a CUDA part; 'help' lists the accel tokens"
+  error "  --accel rocm6.4 --rocm-arch \"gfx942\"     # an AMD part"
+  error "  --accel cpu"
+  error "or build a fixed matrix instead: --preset default | full | arm64 | ci"
+  exit 1
 }
 
 host_arch() {
@@ -875,6 +937,15 @@ print_plan() {
   done
 
   echo
+  [[ -z "${CUDA_ARCH_OVERRIDE}" ]] || echo "${C_BOLD}CUDA archs${C_RESET} ${CUDA_ARCH_OVERRIDE}"
+  [[ -z "${ROCM_ARCH_OVERRIDE}" ]] || echo "${C_BOLD}ROCm archs${C_RESET} ${ROCM_ARCH_OVERRIDE}"
+  [[ -z "${TARGET_NOTE}" ]]        || echo "${C_BOLD}Target${C_RESET} ${TARGET_NOTE}"
+  local mem; mem="$(default_memory_gb)"
+  if [[ "${mem}" != "0" ]]; then
+    echo "${C_BOLD}Memory${C_RESET} container capped at ${mem} GB (host has $(host_available_gb) GB free); --memory overrides"
+  else
+    echo "${C_BOLD}Memory${C_RESET} no container cap (--memory 0, or a remote host)"
+  fi
   echo "${C_BOLD}Output${C_RESET} ${OUT_DIR}/linux-<arch>/<accel>/torch<ver>-cp<py>/"
   echo
 
@@ -1015,15 +1086,26 @@ default_jobs() {
   echo "${n}"
 }
 
-# The --memory default: the host's RAM minus headroom for the OS, the engine
-# and whatever else is running. Only meaningful for a local daemon; a remote
-# host has its own RAM, and its own way to be told about it.
+# Memory the host has to spare right now, in whole GB (0 when unreadable).
+host_available_gb() {
+  local kb; kb="$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
+  echo $(( kb / 1024 / 1024 ))
+}
+
+# The --memory default. It is derived from what is FREE on the host at launch,
+# not from its total RAM: the cap only protects the host if the container can
+# never reach into memory the desktop, the browser and the other daemons are
+# already holding. A cap of "total minus a little" looked safe on paper and
+# still sent a 62 GB machine with 20 GB in use into swap, because the build
+# was allowed 58. Headroom is left for what the host allocates while the build
+# runs. Only meaningful for a local daemon; a remote host has its own RAM, and
+# its own way to be told about it.
 default_memory_gb() {
   if [[ -n "${MEMORY_GB}" ]]; then echo "${MEMORY_GB}"; return; fi
   [[ -z "${DOCKER_HOST_OVERRIDE}" ]] || { echo 0; return; }
-  local kb; kb="$(awk '/^MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null || true)"
-  [[ -n "${kb}" ]] || { echo 0; return; }
-  local gb=$(( kb / 1024 / 1024 - 4 ))
+  local avail; avail="$(host_available_gb)"
+  [[ "${avail}" -gt 0 ]] || { echo 0; return; }
+  local gb=$(( avail - 6 ))
   [[ "${gb}" -lt 8 ]] && gb=8
   echo "${gb}"
 }
@@ -1086,7 +1168,7 @@ accel_covers_caps() {
   done
 }
 
-# Which toolkit --preset local should build with. The preset's own default wins
+# Which toolkit a build for this host should use. The given default wins
 # whenever it can emit code for every GPU here, so the common case keeps the
 # toolkit it always used; only a part that default cannot reach moves the choice,
 # and then to the newest toolkit that covers it, because the newest CUDA line is
@@ -1621,7 +1703,9 @@ build_available_gb() {
 build_jobs_for() {
   local per_job_gb="$1"
   local jobs="${PC_JOBS}" avail; avail="$(build_available_gb)"
-  local fit=$(( avail / per_job_gb ))
+  # pip, setup.py, ninja and the page cache the compile churns through are
+  # not free either; keep a couple of GB out of the compilers' budget.
+  local fit=$(( (avail - 2) / per_job_gb ))
   [[ "${fit}" -lt "${jobs}" ]] && jobs="${fit}"
   [[ "${jobs}" -lt 1 ]] && jobs=1
   echo "${jobs} ${avail}"
@@ -1673,6 +1757,9 @@ build_wheel() {
   read -r jobs avail <<< "$(build_jobs_for "${BUILD_JOB_GB:-3}")"
   c_log "compiling ${label} (this is the slow path)"
   c_log "  jobs=${jobs} (cap ${PC_JOBS}, ~${BUILD_JOB_GB:-3} GB/job, ${avail} GB available)"
+  # Into the manifest too: when a build takes the host down, the container and
+  # its /tmp logs are gone, and this line is the only record of what it tried.
+  record "# ${label}: jobs=${jobs} of ${PC_JOBS} (${BUILD_JOB_GB:-3} GB/job, ${avail} GB available)"
 
   # pip builds into a staging directory, not straight into /out. /out is not
   # empty on a second run -- `--only spconv` rebuilds cumm by design, and any
@@ -2131,17 +2218,23 @@ pkg_flash_attn() {
   fi
 
   # PyPI carries an sdist only, so this always compiles. It is by far the
-  # longest step, and the one that can take a machine down: upstream's setup.py
-  # hands every nvcc `--threads 4` (NVCC_THREADS), so one MAX_JOBS job is four
-  # compiler processes, and upstream measures the peak at 8-9 GB per job. Its
-  # own setup.py would size MAX_JOBS from free memory -- but only when MAX_JOBS
-  # is unset, and build_wheel always sets it. So the same arithmetic is done
-  # here: 9 GB per job, against the memory the container actually has.
-  BUILD_JOB_GB=9 \
+  # longest step, and the one that can take a machine down.
+  #
+  # Upstream's setup.py hands every nvcc `--threads 4` (NVCC_THREADS), which
+  # compiles up to four of the requested arches of one source file at once:
+  # one MAX_JOBS job is then four cicc/ptxas processes, each holding 4-5 GB on
+  # these kernels. Upstream's "8-9 GB per job" figure is for its default two
+  # arches; with the four this script can request it is closer to 18, and a
+  # job count sized for 9 sent a 62 GB host into swap. Memory scales with the
+  # number of concurrent compiles however they are grouped, so the finest
+  # grouping wins: one compile per job (NVCC_THREADS=1), 5 GB per job, and
+  # MAX_JOBS -- which build_jobs_for derives from what is actually free -- is
+  # then the exact number of compiler processes alive at once.
+  BUILD_JOB_GB=5 \
   build_wheel "flash-attn" "git+https://github.com/Dao-AILab/flash-attention.git@v2.8.3.post1" \
     "FLASH_ATTENTION_FORCE_BUILD=TRUE" \
     "FLASH_ATTN_CUDA_ARCHS=${archs}" \
-    "NVCC_THREADS=4" \
+    "NVCC_THREADS=1" \
     ${extra[*]+"${extra[@]}"}
 }
 
