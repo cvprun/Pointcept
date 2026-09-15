@@ -14,6 +14,8 @@
 #
 # The script is self-contained: it re-executes itself inside the build
 # container (see `--in-container`), so there is exactly one file to maintain.
+# With --native there is no container at all: the same stage runs as a child
+# process on the host, against the host's own compilers and CUDA toolkit.
 #
 # Quick start
 #   ./scripts/build_wheels.sh build                       # wheels for this machine's GPU
@@ -45,6 +47,18 @@ SUPPORTED_ENGINES=(docker podman nerdctl)
 ENGINE=""           # resolved executable
 ENGINE_KIND=""      # docker | podman | nerdctl
 ENGINE_ROOTLESS="0"
+
+# --native: no engine. The toolkit the host has installed stands in for the
+# base image, so it is resolved once up front and every combination is checked
+# against it (see validate_native_combo).
+NATIVE="0"
+NATIVE_CUDA_HOME=""
+NATIVE_NVCC_VERSION=""
+NATIVE_SCOPE=""     # "" = not probed yet, then yes | no (see native_scope_usable)
+# Empty when there is no HOME to put it under (cron, `env -i`): clean then has
+# no such cache to remove, and a --native build runs uncached.
+NATIVE_CACHE_DIR="${XDG_CACHE_HOME:-${HOME:+${HOME}/.cache}}"
+NATIVE_CACHE_DIR="${PC_NATIVE_CACHE:-${NATIVE_CACHE_DIR:+${NATIVE_CACHE_DIR}/pointcept-build}}"
 
 # ------------------------------------------------------------------------------
 # Defaults
@@ -349,12 +363,16 @@ ${C_BOLD}BUILD TUNING${C_RESET}
   --jobs      N      Parallel compile jobs (MAX_JOBS)      [nproc, capped at 16]
                      A CPU ceiling: each package lowers it further to what the
                      free memory allows (see build_jobs_for in the script)
-  --memory    GB     Hard memory cap on the build container
+  --memory    GB     Hard memory cap on the build container (a systemd-run
+                     scope under --native)
                      [what is free on the host right now, minus 6 GB]
                      0 disables; unset when building on a --remote-host
   --out       DIR    Output directory                              [wheelhouse]
   --engine    NAME   Container engine: docker | podman | nerdctl
                      [auto-detect, in that order; env PC_ENGINE]
+  --native           No container engine: build on this host with its own
+                     compilers and the CUDA toolkit CUDA_HOME points at
+                     (build and matrix only; see NOTES)
   --remote-host URI  Build on a remote daemon, e.g. ssh://arm-box
                      (alias: --docker-host)
   --no-cache         Disable the shared build cache (downloads AND the venv;
@@ -392,6 +410,9 @@ ${C_BOLD}EXAMPLES${C_RESET}
 
   # No docker on this box? podman works the same way
   ${SCRIPT_NAME} build --engine podman --preset default
+
+  # No container engine at all: the host's gcc and its CUDA 12.8 toolkit
+  CUDA_HOME=/usr/local/cuda-12.8 ${SCRIPT_NAME} build --native
 
   # Only the repository's own CUDA extensions
   ${SCRIPT_NAME} build --only pointops,pointgroup_ops,pointrope
@@ -435,6 +456,17 @@ ${C_BOLD}NOTES${C_RESET}
   * cumm and spconv accept a shorter arch list than nvcc does and reject the
     rest outright, so Thor, Blackwell Ultra and DGX Spark targets are built as
     the newest arch cumm knows plus PTX. Those kernels JIT on first load.
+  * --native runs the build stage on this host instead of in a container. The
+    installed toolkit is the target: CUDA_HOME (else CUDA_PATH, else nvcc on
+    PATH, else /usr/local/cuda) picks the accel, so --accel can only name that
+    toolkit or cpu, --arch only this machine, and --os is ignored. The host
+    needs gcc/g++ and git, plus sparsehash headers for pointgroup_ops; a
+    preflight checks all of it, including that nvcc accepts this gcc, before
+    anything starts. Nothing is installed system-wide and no root is needed:
+    CPython comes from uv, and the venv and torch are cached under
+    ${NATIVE_CACHE_DIR} (env PC_NATIVE_CACHE). The memory
+    cap becomes a systemd-run --user scope when the user manager can enforce
+    one; otherwise only the per-package job sizing protects the host.
 EOF
 }
 
@@ -487,6 +519,7 @@ parse_args() {
       --memory)        MEMORY_GB="$2";            shift 2 ;;
       --out)           OUT_DIR="$2";              shift 2 ;;
       --engine)        ENGINE_REQUESTED="$2";     shift 2 ;;
+      --native)        NATIVE="1";                shift   ;;
       # --docker-host is the historical spelling of --remote-host.
       --remote-host|--docker-host)
                        DOCKER_HOST_OVERRIDE="$2"; shift 2 ;;
@@ -529,6 +562,17 @@ apply_preset() {
     *) die "unknown preset '${PRESET}' (default|full|arm64|ci)" ;;
   esac
 
+  if [[ "${NATIVE}" == "1" ]]; then
+    [[ -z "${DOCKER_HOST_OVERRIDE}" ]] \
+      || die "--native builds on this host; it cannot be combined with --remote-host"
+    # There is no image to pick, so the OS axis only labels the build venv.
+    [[ -z "${OS_LIST}" ]] || warn "--os ${OS_LIST} ignored: a native build uses this host's OS"
+    OS_LIST="$(host_os_label)"
+    # No toolkit is not an error yet: a cpu build needs none, and validation
+    # names what is missing for the combinations that do.
+    native_resolve_toolkit || true
+  fi
+
   : "${OS_LIST:=${DEFAULT_OS}}"
   : "${TORCH_LIST:=${DEFAULT_TORCH}}"
   : "${PYTHON_LIST:=${DEFAULT_PYTHON}}"
@@ -565,6 +609,14 @@ resolve_host_target() {
     why="--arch ${ARCH_LIST} is not this machine's (${host}), so its GPU says nothing about the target"
   elif ! caps="$(host_gpu_caps)"; then
     why="no NVIDIA GPU could be read on this host (nvidia-smi missing, or no compute_cap)"
+  fi
+
+  # A native build has exactly one toolkit to compile with, so that is the
+  # accel -- the driver's ceiling, which the container path goes by, only says
+  # what could run here, not what this host is able to build.
+  if [[ -z "${ACCEL_LIST}" && "${NATIVE}" == "1" ]]; then
+    ACCEL_LIST="$(native_toolkit_accel)" || die_no_native_toolkit
+    TARGET_NOTE="accel ${ACCEL_LIST} from the host toolkit (nvcc ${NATIVE_NVCC_VERSION} at ${NATIVE_CUDA_HOME})"
   fi
 
   if [[ -z "${ACCEL_LIST}" ]]; then
@@ -611,6 +663,63 @@ host_arch() {
     aarch64|arm64)  echo "arm64" ;;
     *) die "unsupported host architecture: $(uname -m)" ;;
   esac
+}
+
+# The host's OS as the matrix spells one (ubuntu24.04). A native build has no
+# image to choose with it; it only keys the build venv and labels the plan.
+host_os_label() {
+  local label=""
+  [[ -r /etc/os-release ]] && label="$(. /etc/os-release && echo "${ID:-}${VERSION_ID:-}")"
+  echo "${label:-linux}"
+}
+
+# The toolkit a native build compiles with, looked up in the order torch's
+# cpp_extension uses -- CUDA_HOME, CUDA_PATH, the nvcc on PATH, /usr/local/cuda
+# -- so what the plan reports is what the extensions will actually find.
+native_resolve_toolkit() {
+  local home="${CUDA_HOME:-${CUDA_PATH:-}}" nvcc
+  if [[ -z "${home}" ]]; then
+    if nvcc="$(command -v nvcc 2>/dev/null)"; then
+      home="$(dirname "$(dirname "$(readlink -f "${nvcc}")")")"
+    elif [[ -x /usr/local/cuda/bin/nvcc ]]; then
+      home="/usr/local/cuda"
+    fi
+  fi
+  [[ -n "${home}" && -x "${home}/bin/nvcc" ]] || return 1
+  NATIVE_CUDA_HOME="${home}"
+  NATIVE_NVCC_VERSION="$("${home}/bin/nvcc" --version 2>/dev/null \
+    | grep -oE 'release [0-9]+\.[0-9]+' | awk '{print $2}')"
+  [[ -n "${NATIVE_NVCC_VERSION}" ]]
+}
+
+# The accel token for that toolkit (12.8 -> cu128), when this script has tables
+# for it: every arch and torch check downstream is keyed by the token.
+native_toolkit_accel() {
+  [[ -n "${NATIVE_NVCC_VERSION}" ]] || return 1
+  local tok="cu${NATIVE_NVCC_VERSION//./}"
+  cuda_full_version "${tok}" >/dev/null || return 1
+  echo "${tok}"
+}
+
+native_hipcc() {
+  local h="${ROCM_PATH:-/opt/rocm}/bin/hipcc"
+  if [[ -x "${h}" ]]; then echo "${h}"; else command -v hipcc; fi
+}
+
+die_no_native_toolkit() {
+  if [[ -z "${NATIVE_CUDA_HOME}" ]]; then
+    error "cannot pick --accel for you: --native compiles with the host's CUDA toolkit, and"
+    error "none was found (looked at CUDA_HOME, CUDA_PATH, nvcc on PATH, /usr/local/cuda)."
+  else
+    error "cannot pick --accel for you: the host toolkit is nvcc ${NATIVE_NVCC_VERSION:-of unknown version}"
+    error "(${NATIVE_CUDA_HOME}), which this script has no tables for (known: ${KNOWN_CUDA_ACCELS[*]})."
+  fi
+  error "Point CUDA_HOME at a toolkit it knows:"
+  error "  CUDA_HOME=/usr/local/cuda-12.8 ${SCRIPT_NAME} build --native"
+  error "Without root, the runfile installs the toolkit alone and leaves the driver be:"
+  error "  sh cuda_<version>_linux.run --silent --toolkit --installpath=\$HOME/cuda-<version>"
+  error "or build without CUDA: --accel cpu"
+  exit 1
 }
 
 split_list() { echo "$1" | tr ',' ' ' | tr -s ' '; }
@@ -666,8 +775,12 @@ expand_matrix() {
       for accel in $(split_list "${ACCEL_LIST}"); do
         for torch in $(split_list "${TORCH_LIST}"); do
           for python in $(split_list "${PYTHON_LIST}"); do
-            validate_combo "${os}" "${arch}" "${accel}" "${torch}" "${python}" \
-              && echo "${os}|${arch}|${accel}|${torch}|${python}"
+            # An if, not `validate && echo`: when the last combination fails
+            # validation that list's status becomes the function's, and the
+            # caller's `combos="$(expand_matrix)"` trips errexit without a word.
+            if validate_combo "${os}" "${arch}" "${accel}" "${torch}" "${python}"; then
+              echo "${os}|${arch}|${accel}|${torch}|${python}"
+            fi
           done
         done
       done
@@ -709,10 +822,52 @@ validate_cuda_arch_list() {
     local alt; alt="$(cuda_accels_supporting "${bad[0]}")"
     warn "skip: nvcc $(cuda_full_version "${accel}") cannot target $(arch_names "${bad[@]}"), asked for by the ${source} '${want}'"
     warn "  ${accel} spans $(arch_names "$(cuda_arch_floor "${accel}")") to $(arch_names "$(cuda_arch_ceiling "${accel}")"); $(arch_names "${bad[0]}") needs ${alt:-a toolkit this script does not know}"
+    [[ "${NATIVE}" != "1" ]] \
+      || warn "  --native compiles with ${NATIVE_CUDA_HOME}; point CUDA_HOME at one of those toolkits"
     return 1
   fi
 
   ARCH_LIST_VERDICT["${key}"]=0
+  return 0
+}
+
+declare -A WARNED_ONCE=()
+warn_once() {
+  local key="$1"; shift
+  [[ -z "${WARNED_ONCE[${key}]:-}" ]] || return 0
+  WARNED_ONCE["${key}"]=1
+  warn "$@"
+}
+
+# A native build has one machine and one toolkit. A combination needing any
+# other cannot be built here at all, so it is dropped the way an impossible
+# image pairing is -- which is also what lets a preset's arm64 half fall away
+# on an amd64 host instead of failing the whole run.
+validate_native_combo() {
+  local arch="$1" accel="$2"
+  if [[ "${arch}" != "$(host_arch)" ]]; then
+    warn_once "native-arch-${arch}" "skip: --native cannot build linux/${arch} on this $(host_arch) host (use a container engine, or build natively on ${arch} hardware)"
+    return 1
+  fi
+  case "$(accel_kind "${accel}")" in
+    cuda)
+      local want; want="$(cuda_full_version "${accel}")"; want="${want%.*}"
+      if [[ -z "${NATIVE_CUDA_HOME}" ]]; then
+        warn_once "native-${accel}" "skip: ${accel} needs a CUDA ${want} toolkit and this host has none (CUDA_HOME, CUDA_PATH, nvcc on PATH, /usr/local/cuda)"
+        return 1
+      fi
+      if [[ "${NATIVE_NVCC_VERSION}" != "${want}" ]]; then
+        warn_once "native-${accel}" "skip: ${accel} needs nvcc ${want}, but the host toolkit is ${NATIVE_NVCC_VERSION} (${NATIVE_CUDA_HOME}); point CUDA_HOME at a ${want} toolkit"
+        return 1
+      fi
+      ;;
+    rocm)
+      if ! native_hipcc >/dev/null; then
+        warn_once "native-${accel}" "skip: ${accel} needs hipcc (\$ROCM_PATH/bin or PATH) and this host has none"
+        return 1
+      fi
+      ;;
+  esac
   return 0
 }
 
@@ -727,7 +882,7 @@ validate_combo() {
   if [[ "${kind}" == "cuda" ]]; then
     cuda_full_version "${accel}" >/dev/null \
       || { warn "skip: no base image mapping for '${accel}'"; return 1; }
-    if [[ " $(cuda_supported_os "${accel}") " != *" ${os} "* ]]; then
+    if [[ "${NATIVE}" != "1" && " $(cuda_supported_os "${accel}") " != *" ${os} "* ]]; then
       warn "skip: ${accel} has no ${os} devel image (use $(cuda_supported_os "${accel}" | awk '{print $1}'))"
       return 1
     fi
@@ -738,6 +893,10 @@ validate_combo() {
       WARNED_INDEX_SUB["${accel}"]=1
       warn "${accel}: PyTorch publishes no ${accel} wheels; torch comes from ${widx} (nvcc stays ${accel})"
     fi
+  fi
+
+  if [[ "${NATIVE}" == "1" ]]; then
+    validate_native_combo "${arch}" "${accel}" || return 1
   fi
 
   # ROCm ships x86_64 only; there is no aarch64 ROCm userspace to build against.
@@ -804,7 +963,7 @@ detect_engine() {
     for candidate in "${SUPPORTED_ENGINES[@]}"; do
       if engine_usable "${candidate}"; then ENGINE="${candidate}"; break; fi
     done
-    [[ -n "${ENGINE}" ]] || die "no usable container engine found (tried: ${SUPPORTED_ENGINES[*]}); install one or pass --engine"
+    [[ -n "${ENGINE}" ]] || die "no usable container engine found (tried: ${SUPPORTED_ENGINES[*]}); install one, pass --engine, or build on this host with --native"
   fi
 
   case "$(basename "${ENGINE}")" in
@@ -907,6 +1066,17 @@ qemu_available_for() {
   esac
 }
 
+# The BASE IMAGE column, or what stands in for it under --native.
+plan_base_for() {
+  local accel="$1" os="$2"
+  if [[ "${NATIVE}" != "1" ]]; then base_image_for "${accel}" "${os}"; return; fi
+  case "$(accel_kind "${accel}")" in
+    cuda) echo "nvcc ${NATIVE_NVCC_VERSION} (${NATIVE_CUDA_HOME})" ;;
+    rocm) native_hipcc || echo "hipcc" ;;
+    *)    command -v g++ || echo "g++" ;;
+  esac
+}
+
 # Print the plan: every combination that survived validation, the packages in
 # build order and where the wheels go. Shared by `matrix` (which prints only
 # this) and `build` (which prints it and then asks before starting).
@@ -918,14 +1088,15 @@ print_plan() {
   echo
   echo "${C_BOLD}Build matrix (${n} combination(s), ${#pkgs[@]} package(s) each)${C_RESET}"
   echo
-  printf '%-14s %-7s %-9s %-9s %-7s %s\n' "OS" "ARCH" "ACCEL" "TORCH" "PYTHON" "BASE IMAGE"
+  local base_hdr="BASE IMAGE"; [[ "${NATIVE}" != "1" ]] || base_hdr="HOST TOOLCHAIN"
+  printf '%-14s %-7s %-9s %-9s %-7s %s\n' "OS" "ARCH" "ACCEL" "TORCH" "PYTHON" "${base_hdr}"
   printf '%s\n' "$(printf '%.0s-' {1..92})"
 
   local os arch accel torch python
   while IFS='|' read -r os arch accel torch python; do
     [[ -n "${os}" ]] || continue
     printf '%-14s %-7s %-9s %-9s %-7s %s\n' \
-      "${os}" "${arch}" "${accel}" "${torch}" "${python}" "$(base_image_for "${accel}" "${os}")"
+      "${os}" "${arch}" "${accel}" "${torch}" "${python}" "$(plan_base_for "${accel}" "${os}")"
   done <<< "${combos}"
 
   echo
@@ -943,10 +1114,16 @@ print_plan() {
   [[ -z "${ROCM_ARCH_OVERRIDE}" ]] || echo "${C_BOLD}ROCm archs${C_RESET} ${ROCM_ARCH_OVERRIDE}"
   [[ -z "${TARGET_NOTE}" ]]        || echo "${C_BOLD}Target${C_RESET} ${TARGET_NOTE}"
   local mem; mem="$(default_memory_gb)"
-  if [[ "${mem}" != "0" ]]; then
-    echo "${C_BOLD}Memory${C_RESET} container capped at ${mem} GB (host has $(host_available_gb) GB free); --memory overrides"
-  else
+  if [[ "${mem}" == "0" && "${NATIVE}" == "1" ]]; then
+    echo "${C_BOLD}Memory${C_RESET} no cap (--memory 0)"
+  elif [[ "${mem}" == "0" ]]; then
     echo "${C_BOLD}Memory${C_RESET} no container cap (--memory 0, or a remote host)"
+  elif [[ "${NATIVE}" != "1" ]]; then
+    echo "${C_BOLD}Memory${C_RESET} container capped at ${mem} GB (host has $(host_available_gb) GB free); --memory overrides"
+  elif native_scope_usable; then
+    echo "${C_BOLD}Memory${C_RESET} build capped at ${mem} GB by a systemd-run scope (host has $(host_available_gb) GB free); --memory overrides"
+  else
+    echo "${C_BOLD}Memory${C_RESET} no cap: systemd-run cannot enforce MemoryMax for this user; compile jobs are still sized by free memory"
   fi
   echo "${C_BOLD}Output${C_RESET} ${OUT_DIR}/linux-<arch>/<accel>/torch<ver>-cp<py>/"
   echo
@@ -996,6 +1173,23 @@ cmd_clean() {
   # is not a plausible wheel output directory.
   [[ -n "${OUT_DIR}" && "${OUT_DIR}" != "/" ]] \
     || die "refusing to clean '${OUT_DIR}'"
+  # PC_NATIVE_CACHE is user supplied as well.
+  local home="${HOME:-}"
+  if [[ -n "${NATIVE_CACHE_DIR}" ]]; then
+    case "${NATIVE_CACHE_DIR%/}" in
+      ""|"${home%/}") die "refusing to clean native cache '${NATIVE_CACHE_DIR}'" ;;
+    esac
+  fi
+
+  # --native keeps its venvs here rather than in a volume no engine knows about.
+  if [[ -d "${NATIVE_CACHE_DIR}" ]]; then
+    log "removing native build cache ${NATIVE_CACHE_DIR}"
+    if [[ "${DRY_RUN}" == "1" ]]; then
+      echo "rm -rf ${NATIVE_CACHE_DIR}"
+    else
+      rm -rf "${NATIVE_CACHE_DIR}"
+    fi
+  fi
 
   if [[ ! -d "${OUT_DIR}" ]]; then
     info "nothing to clean (${OUT_DIR} does not exist)"
@@ -1011,11 +1205,31 @@ cmd_clean() {
   fi
 
   if [[ "${DRY_RUN}" != "1" ]]; then
-    # Best effort: the cache volume only exists once a build has run.
-    detect_engine 2>/dev/null \
-      && "${ENGINE}" volume rm pointcept-build-cache >/dev/null 2>&1 || true
+    # Best effort: the cache volume only exists once a build has run, and a
+    # host with no engine has none -- detect_engine dies there, so it runs in a
+    # subshell that is allowed to.
+    ( detect_engine 2>/dev/null \
+      && "${ENGINE}" volume rm pointcept-build-cache >/dev/null 2>&1 ) || true
   fi
   info "cleaned"
+}
+
+# The environment the build stage runs under, one KEY=VALUE per line. The
+# container path passes each as -e and the native one as an `env` argument, so
+# the two cannot drift apart on what a combination means.
+stage_env() {
+  local os="$1" arch="$2" accel="$3" torch="$4" python="$5"
+  local widx; widx="$(torch_index_accel "${accel}")"
+  printf '%s\n' \
+    "PC_OS=${os}" "PC_ARCH=${arch}" "PC_ACCEL=${accel}" \
+    "PC_TORCH=${torch}" "PC_PYTHON=${python}" \
+    "PC_FORCE_SOURCE=${FORCE_SOURCE}" "PC_VERBOSE=${VERBOSE}" \
+    "PC_JOBS=${JOBS:-$(default_jobs)}" \
+    "PC_TORCH_ACCEL=${widx}" "PC_TORCH_INDEX=$(torch_index_url "${widx}")"
+  case "$(accel_kind "${accel}")" in
+    cuda) echo "TORCH_CUDA_ARCH_LIST=${CUDA_ARCH_OVERRIDE:-$(default_cuda_arch_list "${accel}" "${arch}")}" ;;
+    rocm) echo "PYTORCH_ROCM_ARCH=${ROCM_ARCH_OVERRIDE:-$(default_rocm_arch_list)}" ;;
+  esac
 }
 
 # Assemble the `run` invocation shared by build/shell/image.
@@ -1023,10 +1237,9 @@ engine_run_args() {
   local os="$1" arch="$2" accel="$3" torch="$4" python="$5"
   local -a args=(run --rm --platform "linux/${arch}")
 
-  args+=(-e "PC_OS=${os}" -e "PC_ARCH=${arch}" -e "PC_ACCEL=${accel}")
-  args+=(-e "PC_TORCH=${torch}" -e "PC_PYTHON=${python}")
-  args+=(-e "PC_FORCE_SOURCE=${FORCE_SOURCE}" -e "PC_VERBOSE=${VERBOSE}")
-  args+=(-e "PC_JOBS=${JOBS:-$(default_jobs)}")
+  local kv
+  while IFS= read -r kv; do args+=(-e "${kv}"); done \
+    < <(stage_env "${os}" "${arch}" "${accel}" "${torch}" "${python}")
 
   # A hard ceiling, swap included, so a compile that outgrows the host takes
   # down one nvcc inside the container (pip fails, the package is recorded as
@@ -1036,8 +1249,6 @@ engine_run_args() {
   if [[ -n "${mem}" && "${mem}" != "0" ]]; then
     args+=(--memory "${mem}g" --memory-swap "${mem}g")
   fi
-  args+=(-e "PC_TORCH_ACCEL=$(torch_index_accel "${accel}")")
-  args+=(-e "PC_TORCH_INDEX=$(torch_index_url "$(torch_index_accel "${accel}")")")
 
   # Under a rootful engine the build runs as real root, so the wheels must be
   # handed back to the invoking user. Under a rootless engine container root is
@@ -1045,13 +1256,6 @@ engine_run_args() {
   # unusable subuid (e.g. 100999) that the user cannot even read.
   if [[ "${ENGINE_ROOTLESS}" != "1" ]]; then
     args+=(-e "PC_HOST_UID=$(id -u)" -e "PC_HOST_GID=$(id -g)")
-  fi
-
-  local kind; kind="$(accel_kind "${accel}")"
-  if [[ "${kind}" == "cuda" ]]; then
-    args+=(-e "TORCH_CUDA_ARCH_LIST=${CUDA_ARCH_OVERRIDE:-$(default_cuda_arch_list "${accel}" "${arch}")}")
-  elif [[ "${kind}" == "rocm" ]]; then
-    args+=(-e "PYTORCH_ROCM_ARCH=${ROCM_ARCH_OVERRIDE:-$(default_rocm_arch_list)}")
   fi
 
   # The repository is mounted read-only; libs/ are copied inside before build
@@ -1294,14 +1498,144 @@ preflight_host_cuda() {
   fi
 }
 
+# ==============================================================================
+# Native builds (--native)
+#
+# The same in-container stage, run as a child of this script on the host. What
+# the base image used to provide -- a toolkit, a compiler nvcc accepts, the
+# sparsehash headers -- has to be on the host already, so it is checked up
+# front; what the container used to enforce -- the memory ceiling -- moves to a
+# systemd scope.
+# ==============================================================================
+
+# The native stand-in for `--memory`: a transient systemd scope with MemoryMax,
+# swap included, the same hard ceiling a container gets. It needs the user
+# manager to have the memory controller delegated, and without it the scope may
+# start regardless and simply not enforce the limit -- so the probe has the
+# scope read its own memory.max back rather than trusting the exit status.
+native_scope_usable() {
+  if [[ -z "${NATIVE_SCOPE}" ]]; then
+    NATIVE_SCOPE="no"
+    if command -v systemd-run >/dev/null 2>&1; then
+      local got
+      got="$(systemd-run --user --scope --quiet -p MemoryMax=1G -- \
+        sh -c 'cat "/sys/fs/cgroup$(sed -n "s/^0:://p" /proc/self/cgroup)/memory.max"' 2>/dev/null || true)"
+      [[ "${got}" == "1073741824" ]] && NATIVE_SCOPE="yes"
+    fi
+  fi
+  [[ "${NATIVE_SCOPE}" == "yes" ]]
+}
+
+# nvcc refuses host compilers newer than the ones it was released against
+# ("unsupported GNU version"). On a container image that never comes up; on a
+# host it is the likeliest thing to go wrong, and a one-line kernel finds out
+# in a second instead of an hour into flash-attn. NVCC_PREPEND_FLAGS applies
+# here as it does to the real build, so a -ccbin fix is honoured.
+native_nvcc_probe() {
+  local dir; dir="$(mktemp -d)"
+  echo '__global__ void probe() {}' > "${dir}/probe.cu"
+  local out rc=0
+  out="$("${NATIVE_CUDA_HOME}/bin/nvcc" -c "${dir}/probe.cu" -o "${dir}/probe.o" 2>&1)" || rc=$?
+  rm -rf "${dir}"
+  [[ ${rc} -ne 0 ]] || return 0
+  echo "${out}" | grep -m1 -iE 'error|unsupported' || echo "${out}" | tail -1
+  return 1
+}
+
+# What the base image would have supplied, checked before anything is built.
+# Every miss is reported at once, each with its fix: finding them one failed
+# package at a time, an hour into a build, is the thing to avoid.
+native_preflight() {
+  local combos="$1"; shift
+  local pkg_set=" $* "
+  local -a miss=()
+  local t
+
+  for t in gcc g++ git; do
+    command -v "${t}" >/dev/null 2>&1 \
+      || miss+=("${t}: apt install build-essential git | dnf install gcc-c++ git | conda install -c conda-forge compilers git")
+  done
+
+  # uv is fetched with curl when neither the host nor the cache has one.
+  if ! command -v uv >/dev/null 2>&1 \
+     && [[ ! -x "${HOME:-}/.local/bin/uv" ]] \
+     && [[ -z "${NATIVE_CACHE_DIR}" || ! -x "${NATIVE_CACHE_DIR}/bin/uv" ]] \
+     && ! command -v curl >/dev/null 2>&1; then
+    miss+=("uv, or curl to fetch it: https://docs.astral.sh/uv/getting-started/installation/")
+  fi
+
+  if grep -q '|cu' <<< "${combos}" && command -v g++ >/dev/null 2>&1; then
+    local why
+    if ! why="$(native_nvcc_probe)"; then
+      miss+=("nvcc ${NATIVE_NVCC_VERSION} (${NATIVE_CUDA_HOME}) cannot compile with g++ $(g++ -dumpfullversion 2>/dev/null): ${why}")
+      miss+=("  if that names an unsupported GNU version, hand nvcc an older gcc: NVCC_PREPEND_FLAGS='-ccbin g++-13'")
+    fi
+  fi
+
+  # pointgroup_ops includes <google/dense_hash_map>; every non-cpu target builds it.
+  if [[ "${pkg_set}" == *" pointgroup_ops "* ]] && grep -qv '|cpu|' <<< "${combos}" \
+     && command -v g++ >/dev/null 2>&1 \
+     && ! g++ -x c++ -fsyntax-only - <<< '#include <google/dense_hash_map>' >/dev/null 2>&1; then
+    miss+=("sparsehash headers (pointgroup_ops): apt install libsparsehash-dev | dnf install sparsehash-devel | conda install -c conda-forge sparsehash, then export CPATH=\$CONDA_PREFIX/include")
+  fi
+
+  [[ ${#miss[@]} -eq 0 ]] && return 0
+  error "this host lacks what the build image would have provided:"
+  for t in "${miss[@]}"; do error "  ${t}"; done
+  exit 1
+}
+
+# The native counterpart of `engine run ... bash /builder.sh --in-container`:
+# the same stage and environment, as a child of this script. A child rather
+# than a function call, because the stage activates a venv and rewrites PATH,
+# and none of that may leak into the next combination -- nor may one of its
+# `die`s end the whole matrix. Its logs and clones go to a scratch directory
+# that is removed on success and kept for inspection on failure.
+run_native_stage() {
+  local os="$1" arch="$2" accel="$3" torch="$4" python="$5" pkg_list="$6" out_sub="$7"
+  local -a cmd=()
+
+  local mem; mem="$(default_memory_gb)"
+  if [[ "${mem}" != "0" ]] && native_scope_usable; then
+    cmd+=(systemd-run --user --scope --quiet -p "MemoryMax=${mem}G" -p "MemorySwapMax=0" --)
+  fi
+
+  local work="${TMPDIR:-/tmp}/pointcept-build-XXXXXX"
+  [[ "${DRY_RUN}" == "1" ]] || work="$(mktemp -d -t pointcept-build-XXXXXX)"
+
+  cmd+=(env)
+  local kv
+  while IFS= read -r kv; do cmd+=("${kv}"); done \
+    < <(stage_env "${os}" "${arch}" "${accel}" "${torch}" "${python}")
+  cmd+=("PC_NATIVE=1" "PC_OUT=${out_sub}" "PC_SRC=${REPO_ROOT}" "PC_WORK=${work}")
+  [[ "${USE_CACHE}" != "1" ]] || cmd+=("PC_CACHE=${NATIVE_CACHE_DIR}")
+  [[ "$(accel_kind "${accel}")" != "cuda" ]] || cmd+=("PC_CUDA_HOME=${NATIVE_CUDA_HOME}")
+  cmd+=(bash "${SCRIPT_PATH}" --in-container --pkg-list "${pkg_list}")
+
+  if [[ "${DRY_RUN}" == "1" ]]; then
+    echo "mkdir -p ${out_sub}"
+    printf '%q ' "${cmd[@]}"; echo
+    return 0
+  fi
+
+  mkdir -p "${out_sub}"
+  if "${cmd[@]}"; then
+    rm -rf "${work}"
+    return 0
+  fi
+  warn "build logs and sources kept in ${work}"
+  return 1
+}
+
 cmd_build() {
-  require_engine
+  [[ "${NATIVE}" == "1" ]] || require_engine
   local combos; combos="$(expand_matrix)"
   [[ -n "${combos}" ]] || die "matrix is empty after validation"
 
   local -a pkgs; mapfile -t pkgs < <(selected_packages)
   [[ ${#pkgs[@]} -gt 0 ]] || die "no packages selected"
   local pkg_list; pkg_list="$(IFS=,; echo "${pkgs[*]}")"
+  [[ "${NATIVE}" != "1" ]] || native_preflight "${combos}" "${pkgs[@]}"
 
   local total; total="$(echo "${combos}" | wc -l)"
   local index=0 failed=0
@@ -1338,6 +1672,22 @@ cmd_build() {
         continue
       fi
       return 1
+    fi
+
+    if [[ "${NATIVE}" == "1" ]]; then
+      local out_native="${OUT_DIR}/${tag}"
+      if run_native_stage "${os}" "${arch}" "${accel}" "${torch}" "${python}" "${pkg_list}" "${out_native}"; then
+        if [[ "${DRY_RUN}" != "1" ]]; then
+          info "${tag} done -> ${out_native}"
+          produced+=("${out_native}")
+        fi
+      else
+        error "${tag} failed"
+        failures+=("${tag}")
+        failed=$((failed + 1))
+        [[ "${KEEP_GOING}" == "1" ]] || return 1
+      fi
+      continue
     fi
 
     local base; base="$(normalize_image "$(base_image_for "${accel}" "${os}")")"
@@ -1486,14 +1836,24 @@ EOF
 # Everything below runs inside the target container, under the target
 # architecture. It provisions a toolchain, installs the requested torch build,
 # then produces one wheel per requested package into /out.
+#
+# Under --native the same code runs as a child of the host-side script (see
+# run_native_stage): the host's toolchain is used as found, and real
+# directories stand in for the mount points.
 # ==============================================================================
 PKG_LIST=""
+
+# Where the stage reads and writes: fixed mount points inside a container, host
+# directories handed in by run_native_stage under --native.
+STAGE_OUT="${PC_OUT:-/out}"
+STAGE_SRC="${PC_SRC:-/src}"
+STAGE_WORK="${PC_WORK:-/tmp}"
 
 c_log()  { echo "${C_BLUE}  ->${C_RESET} $*" >&2; }
 c_ok()   { echo "${C_GREEN}  ok${C_RESET} $*" >&2; }
 c_warn() { echo "${C_YELLOW}  !!${C_RESET} $*" >&2; }
 
-MANIFEST="/out/manifest.txt"
+MANIFEST="${STAGE_OUT}/manifest.txt"
 record() { echo "$1" >> "${MANIFEST}"; }
 
 # ------------------------------------------------------------------------------
@@ -1524,6 +1884,22 @@ VENV_DIR="/opt/venv"
 PY=""
 
 container_init_cache() {
+  if [[ "${PC_NATIVE:-0}" == "1" ]]; then
+    # No volume on the host. The parent names a cache directory, or none under
+    # --no-cache, and then the venv lives and dies with the scratch directory.
+    # uv's own interpreters already outlive every run in the user's uv data
+    # directory, so UV_PYTHON_INSTALL_DIR is left alone.
+    VENV_DIR="${STAGE_WORK}/venv"
+    if [[ -z "${PC_CACHE:-}" ]]; then
+      c_log "no build cache; provisioning the build environment from scratch"
+      return 0
+    fi
+    CACHE_ROOT="${PC_CACHE}"
+    VENV_DIR="${CACHE_ROOT}/venv/${PC_OS}-${PC_ARCH}-${PC_ACCEL}-torch${PC_TORCH}-cp${PC_PYTHON//./}"
+    mkdir -p "${CACHE_ROOT}/bin"
+    return 0
+  fi
+
   if [[ ! -d /cache ]]; then
     c_log "no cache volume mounted; provisioning the build environment from scratch"
     return 0
@@ -1570,10 +1946,29 @@ container_prepare_system() {
   c_ok "system toolchain ready"
 }
 
+# The host's toolchain is the host's business: nothing is installed and no apt
+# source is touched. The parent has already checked the pieces are there (see
+# native_preflight); this only points the build at the toolkit it checked.
+native_prepare_system() {
+  # A PYTHONPATH from the calling shell would sit ahead of the venv, and an
+  # installed cumm there is exactly what spoils a cumm build (see pkg_cumm).
+  unset PYTHONPATH PYTHONHOME
+  if [[ -n "${PC_CUDA_HOME:-}" ]]; then
+    export CUDA_HOME="${PC_CUDA_HOME}"
+    export PATH="${CUDA_HOME}/bin:${PATH}"
+    c_ok "host CUDA toolkit $(nvcc --version | grep -oE 'release [0-9.]+' | awk '{print $2}') at ${CUDA_HOME}"
+  fi
+  c_ok "host compiler g++ $(g++ -dumpfullversion 2>/dev/null || echo '(unknown version)')"
+}
+
 container_prepare_python() {
+  # Where a fetched uv goes: the cache when there is one, else somewhere that
+  # goes away with the run. Under --native that must not be the user's own
+  # ~/.local/bin, which a build has no business writing to.
   local uv_dir="/root/.local/bin"
+  [[ "${PC_NATIVE:-0}" == "1" ]] && uv_dir="${STAGE_WORK}/bin"
   [[ -n "${CACHE_ROOT}" ]] && uv_dir="${CACHE_ROOT}/bin"
-  export PATH="${uv_dir}:/root/.local/bin:${PATH}"
+  export PATH="${uv_dir}:${HOME:-/root}/.local/bin:${PATH}"
 
   if ! command -v uv >/dev/null 2>&1; then
     c_log "installing uv into ${uv_dir}"
@@ -1600,8 +1995,19 @@ container_prepare_python() {
     # happens to ship, which is what makes the python axis of the matrix work.
     # --seed is required: uv creates bare venvs, but `pip download` and
     # `pip wheel` are the front-ends used below and they must exist in the venv.
-    uv venv --seed --python "${PC_PYTHON}" "${VENV_DIR}" >/dev/null 2>&1 \
-      || die "uv could not provision CPython ${PC_PYTHON}"
+    if [[ "${PC_NATIVE:-0}" == "1" ]]; then
+      # On a host uv would happily build the venv on /usr/bin/python3.12,
+      # which without the distro's -dev package has no Python.h -- and every
+      # extension below then dies on its first #include. uv's own CPython
+      # builds carry their headers, so only those are allowed. The flag is
+      # uv 0.7+; an older host uv only knows the preference spelling.
+      uv venv --seed --managed-python --python "${PC_PYTHON}" "${VENV_DIR}" >/dev/null 2>&1 \
+        || uv venv --seed --python-preference only-managed --python "${PC_PYTHON}" "${VENV_DIR}" >/dev/null 2>&1 \
+        || die "uv could not provision a uv-managed CPython ${PC_PYTHON}"
+    else
+      uv venv --seed --python "${PC_PYTHON}" "${VENV_DIR}" >/dev/null 2>&1 \
+        || die "uv could not provision CPython ${PC_PYTHON}"
+    fi
   fi
 
   export VIRTUAL_ENV="${VENV_DIR}"
@@ -1653,9 +2059,9 @@ prune_stale_wheels() {
   local keep="$1"
   local dist; dist="$(basename "${keep}")"; dist="${dist%%-*}"
 
-  compgen -G "/out/${dist}-*.whl" >/dev/null || return 0
+  compgen -G "${STAGE_OUT}/${dist}-*.whl" >/dev/null || return 0
   local other
-  for other in /out/"${dist}"-*.whl; do
+  for other in "${STAGE_OUT}/${dist}"-*.whl; do
     [[ "$(basename "${other}")" == "$(basename "${keep}")" ]] && continue
     rm -f "${other}"
     c_warn "removed stale $(basename "${other}") (superseded by $(basename "${keep}"))"
@@ -1687,9 +2093,9 @@ try_prebuilt() {
 
   if [[ ${rc} -eq 0 ]] && compgen -G "${tmp}/*.whl" >/dev/null; then
     local name; name="$(basename "$(ls "${tmp}"/*.whl | head -1)")"
-    cp "${tmp}"/*.whl /out/
+    cp "${tmp}"/*.whl "${STAGE_OUT}/"
     rm -rf "${tmp}"
-    prune_stale_wheels "/out/${name}"
+    prune_stale_wheels "${STAGE_OUT}/${name}"
     c_ok "prebuilt  ${name}"
     record "prebuilt  ${name}"
     return 0
@@ -1705,10 +2111,14 @@ try_prebuilt() {
 build_available_gb() {
   local kb; kb="$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
   local avail=$(( kb / 1024 / 1024 ))
-  local max cur f
-  for f in /sys/fs/cgroup/memory.max; do
-    [[ -r "${f}" ]] || continue
-    max="$(cat "${f}")"; cur="$(cat /sys/fs/cgroup/memory.current 2>/dev/null || echo 0)"
+  # This process's own cgroup as well as the root: inside a container the two
+  # are the same directory (its namespace root, where docker --memory lands);
+  # under --native the limit sits on the systemd-run scope, deep in the tree.
+  local cg; cg="$(sed -n 's/^0:://p' /proc/self/cgroup 2>/dev/null || true)"
+  local dir max cur
+  for dir in "/sys/fs/cgroup${cg%/}" /sys/fs/cgroup; do
+    [[ -r "${dir}/memory.max" ]] || continue
+    max="$(cat "${dir}/memory.max")"; cur="$(cat "${dir}/memory.current" 2>/dev/null || echo 0)"
     [[ "${max}" =~ ^[0-9]+$ ]] || continue
     local room=$(( (max - cur) / 1024 / 1024 / 1024 ))
     [[ "${room}" -lt "${avail}" ]] && avail="${room}"
@@ -1738,7 +2148,10 @@ build_jobs_for() {
 # ninja on PATH adds -j from PC_NINJA_JOBS whenever the caller did not, which
 # is exactly the ccimport case, and leaves an explicit -j alone.
 container_install_ninja_shim() {
+  # On a host, under the cache when there is one: a hardened /tmp is often
+  # mounted noexec, and a shim that cannot execute takes ninja down with it.
   local dir="/opt/pc-shim"
+  [[ "${PC_NATIVE:-0}" != "1" ]] || dir="${CACHE_ROOT:-${STAGE_WORK}}/pc-shim"
   mkdir -p "${dir}"
   cat > "${dir}/ninja" <<'SHIM'
 #!/usr/bin/env bash
@@ -1802,7 +2215,7 @@ build_wheel() {
   # discover the CUDA/HIP toolchain, which an isolated env would not have.
   cmd+=("${PY}" -m pip wheel --no-deps --no-build-isolation --wheel-dir "${stage}" "${src}")
 
-  local logfile="/tmp/${label//\//_}.log"
+  local logfile="${STAGE_WORK}/${label//\//_}.log"
   local rc=0
   # errexit is explicitly suspended around the compile: a failing package must
   # be recorded and reported, not abort the whole matrix mid-flight.
@@ -1830,9 +2243,9 @@ build_wheel() {
   fi
 
   local name; name="$(basename "$(ls -t "${stage}"/*.whl | head -1)")"
-  mv -f "${stage}"/*.whl /out/
+  mv -f "${stage}"/*.whl "${STAGE_OUT}/"
   rm -rf "${stage}"
-  prune_stale_wheels "/out/${name}"
+  prune_stale_wheels "${STAGE_OUT}/${name}"
 
   c_ok "compiled  ${name}"
   record "compiled  ${name}"
@@ -1861,8 +2274,8 @@ install_build_dep() {
   local esc="${dist//[-._]/_}"
 
   local whl=""
-  compgen -G "/out/${esc}-*.whl" >/dev/null \
-    && whl="$(ls -t /out/"${esc}"-*.whl | head -1)"
+  compgen -G "${STAGE_OUT}/${esc}-*.whl" >/dev/null \
+    && whl="$(ls -t "${STAGE_OUT}/${esc}"-*.whl | head -1)"
 
   # No --no-deps: pccm and cumm are unimportable without theirs (ccimport,
   # pybind11, fire), and those are pure python, so resolving them from the index
@@ -1881,7 +2294,7 @@ install_build_dep() {
   fi
 
   c_warn "${dist} is required to build this package but could not be installed"
-  [[ -z "${whl}" ]] && c_warn "  no ${esc}-*.whl in /out; build it first (--only ${pkg})"
+  [[ -z "${whl}" ]] && c_warn "  no ${esc}-*.whl in ${STAGE_OUT}; build it first (--only ${pkg})"
   return 1
 }
 
@@ -2040,7 +2453,7 @@ SPCONV_REPO="${PC_SPCONV_REPO:-https://github.com/traveller59/spconv.git}"
 # build will link against. Echoes the path to the patched tree.
 spconv_patched_source() {
   local cumm_dist="$1"
-  local work="/tmp/spconv-src"
+  local work="${STAGE_WORK}/spconv-src"
 
   rm -rf "${work}"
   git clone --quiet --depth 1 "${SPCONV_REPO}" "${work}" || {
@@ -2288,7 +2701,7 @@ pkg_swin3d() {
 # first so setuptools can drop build/ and *.egg-info next to the sources.
 pkg_local() {
   local name="$1"
-  local src="/src/libs/${name}"
+  local src="${STAGE_SRC}/libs/${name}"
   [[ -d "${src}" ]] || { c_warn "${name}: ${src} not found in the repository"; return 1; }
 
   # pointseg is a CppExtension and builds without a device toolchain; the rest
@@ -2299,7 +2712,7 @@ pkg_local() {
     return 0
   fi
 
-  local work="/tmp/libs/${name}"
+  local work="${STAGE_WORK}/libs/${name}"
   mkdir -p "$(dirname "${work}")"
   rm -rf "${work}"
   cp -r "${src}" "${work}"
@@ -2319,7 +2732,7 @@ run_in_container() {
   # into the shared VERBOSE that debug() reads.
   VERBOSE="${PC_VERBOSE}"
 
-  mkdir -p /out
+  mkdir -p "${STAGE_OUT}"
   # Appended, never truncated: --only makes "one package per invocation" a
   # supported workflow, and each of those is a separate container writing to the
   # same directory. Truncating would leave the manifest describing the last
@@ -2333,7 +2746,7 @@ run_in_container() {
   [[ -n "${TORCH_CUDA_ARCH_LIST:-}" ]] && echo "${C_BOLD}archs ${C_RESET} ${TORCH_CUDA_ARCH_LIST}" >&2
 
   container_init_cache
-  container_prepare_system
+  if [[ "${PC_NATIVE:-0}" == "1" ]]; then native_prepare_system; else container_prepare_system; fi
   container_prepare_python
   container_install_torch
   container_install_ninja_shim
@@ -2366,13 +2779,13 @@ run_in_container() {
 
   echo >&2
   if [[ -n "${PC_HOST_UID:-}" ]]; then
-    chown -R "${PC_HOST_UID}:${PC_HOST_GID:-${PC_HOST_UID}}" /out 2>/dev/null || true
+    chown -R "${PC_HOST_UID}:${PC_HOST_GID:-${PC_HOST_UID}}" "${STAGE_OUT}" 2>/dev/null || true
   fi
   if [[ ${failed} -gt 0 ]]; then
     error "${failed} package(s) failed; see ${MANIFEST}"
     return 1
   fi
-  info "all packages built into /out"
+  info "all packages built into ${STAGE_OUT}"
 }
 
 # ==============================================================================
@@ -2384,6 +2797,13 @@ main() {
   if [[ "${IN_CONTAINER}" == "1" ]]; then
     run_in_container
     return $?
+  fi
+
+  if [[ "${NATIVE}" == "1" ]]; then
+    case "${COMMAND}" in
+      image|shell|setup-qemu)
+        die "'${COMMAND}' needs a container engine; --native only covers build and matrix" ;;
+    esac
   fi
 
   apply_preset

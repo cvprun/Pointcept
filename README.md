@@ -313,6 +313,23 @@ If you find _Pointcept_ useful to your research, please cite our work as encoura
   under both rootful and rootless engines. The one thing a rootless engine cannot do is register QEMU
   binfmt handlers; `setup-qemu` detects that and prints the `sudo` / `qemu-user-static` alternatives.
 
+  No container engine at all? `--native` runs the same build on the host itself. With no image to take a
+  toolkit from, the installed one is the target: `CUDA_HOME` (else `CUDA_PATH`, else the `nvcc` on `PATH`,
+  else `/usr/local/cuda`) decides the accelerator, `--arch` can only be this machine, and combinations that
+  would need another toolkit or architecture are dropped with a note — a preset's arm64 half simply falls
+  away on an amd64 host. Before anything runs, a preflight checks what the image would have supplied and
+  reports every miss with its fix: `gcc`/`g++` and `git`, the sparsehash headers `pointgroup_ops` includes,
+  and that `nvcc` accepts the host's gcc at all (it rejects releases newer than it shipped against;
+  `NVCC_PREPEND_FLAGS='-ccbin g++-13'` is the usual fix). No root is needed and nothing is installed
+  system-wide: CPython comes from uv — its own builds, since a distro Python without its `-dev` package has
+  no `Python.h` — and the venv and torch are cached under `~/.cache/pointcept-build`. The container's memory
+  ceiling becomes a `systemd-run --user` scope with `MemoryMax`, applied when the user manager can actually
+  enforce one.
+
+  ```bash
+  CUDA_HOME=/usr/local/cuda-12.8 ./scripts/build_wheels.sh build --native
+  ```
+
   A full matrix compiled natively on a slow machine can run for the better part of a day, so the build is
   splittable: `--only <packages>` restricts one invocation to part of the set, and everything accumulates
   into the same output directory. Dependencies come along automatically — `--only spconv` builds `pccm`
@@ -334,6 +351,8 @@ If you find _Pointcept_ useful to your research, please cite our work as encoura
   multi-gigabyte torch install every time. It does not: the toolchain's packages, the Python interpreter,
   the virtualenv and its torch install are kept in a build cache volume keyed by the target, so only the
   first run provisions anything. `--no-cache` opts out and `clean` drops the volume along with the wheels.
+  `--native` keeps the same cache in `~/.cache/pointcept-build` instead (`PC_NATIVE_CACHE` moves it), and
+  `clean` removes that too.
 
   Wheels land in `wheelhouse/linux-<arch>/<accel>/torch<ver>-cp<py>/`, each directory carrying a
   `manifest.txt` that records whether a wheel was downloaded or compiled, appended to once per run.
