@@ -16,3 +16,5 @@ wheelhouse/
 **/*.out
 Dockerfile
 .claude/
+# verify_mlops.sh downloads its public sample cloud here
+.verify-cache/
