@@ -19,6 +19,13 @@
 #   pointcept_semseg.py   the training job the platform's Kubernetes Job runs
 #   pointcept_pyfunc.py   the model the serving container loads
 #
+# The platform's source does not have to be present. Those three files are
+# vendored under scripts/mlops_runtime/, because the machines worth testing on
+# -- a DGX Spark, a cluster node -- are exactly the ones that carry no mlops
+# checkout. A real checkout still wins when one is there, and the copy is
+# compared against it so a stale vendor announces itself rather than quietly
+# verifying code nobody runs any more.
+#
 # It reuses verify_wheels.sh's venv rather than building a second one: those
 # wheels are linked against one torch, and a separate environment would either
 # duplicate a multi-gigabyte install or quietly resolve a different one.
@@ -34,8 +41,8 @@
 # learns nothing is a finding rather than the expected outcome.
 #
 # Quick start
-#   ./scripts/verify_mlops.sh                        # newest wheelhouse, ../mlops
-#   ./scripts/verify_mlops.sh --mlops ~/src/mlops
+#   ./scripts/verify_mlops.sh                        # newest wheelhouse
+#   ./scripts/verify_mlops.sh --mlops ~/src/mlops    # against a live checkout
 #   ./scripts/verify_mlops.sh --spconv-native        # exercise the Native path
 #   ./scripts/verify_mlops.sh --skip-wheels --keep   # iterate on an existing venv
 #
@@ -81,6 +88,8 @@ GRID_SIZE="0.02"
 BATCH_SIZE="2"
 SPCONV_NATIVE="0"
 SCENES="8"
+UPDATE_BUNDLE="0"
+BUNDLE_DIR=""
 CACHE_DIR="${POINTCEPT_VERIFY_CACHE:-${REPO_ROOT}/.verify-cache}"
 
 usage() {
@@ -89,7 +98,8 @@ ${SCRIPT_NAME} -- run the mlops training and inference entrypoints on a wheelhou
 
 Usage: ${SCRIPT_NAME} [options] [wheelhouse]
 
-  --mlops PATH       mlops checkout (default: ${REPO_ROOT}/../mlops)
+  --mlops PATH       mlops checkout (default: the vendored copy, or ../mlops)
+  --update-bundle    refresh scripts/mlops_runtime/ from --mlops and exit
   --venv PATH        virtualenv to build in (default: a temporary one)
   --keep             keep the venv and the work directory
   --skip-wheels      do not run verify_wheels.sh first
@@ -116,14 +126,48 @@ while [[ $# -gt 0 ]]; do
     --batch-size)     BATCH_SIZE="${2:?}"; shift 2 ;;
     --scenes)         SCENES="${2:?}"; shift 2 ;;
     --spconv-native)  SPCONV_NATIVE="1"; shift ;;
+    --update-bundle)  UPDATE_BUNDLE="1"; shift ;;
     -h|--help)        usage; exit 0 ;;
     -*)               c_die "unknown option: $1" ;;
     *)                WHEELHOUSE="$1"; shift ;;
   esac
 done
 
+#: The vendored copy of the three entrypoints, and the path they live at inside
+#: an mlops checkout. Kept as one name each so --update-bundle and the drift
+#: check cannot disagree with what the run actually uses.
+BUNDLE_DIR="${REPO_ROOT}/scripts/mlops_runtime"
+RUNTIME_SUBPATH="src/geo_mlops/resources/training_runtime"
+RUNTIME_FILES=(pointcept_semseg.py pointcept_pyfunc.py annotations.py)
+
+#: Set when --mlops was given: then a missing checkout is an error rather than
+#: a reason to reach for the vendored copy.
+MLOPS_EXPLICIT="0"
+[[ -n "${MLOPS_DIR}" ]] && MLOPS_EXPLICIT="1"
 [[ -n "${MLOPS_DIR}" ]] || MLOPS_DIR="${REPO_ROOT}/../mlops"
 MLOPS_DIR="$(readlink -f "${MLOPS_DIR}" 2>/dev/null || echo "${MLOPS_DIR}")"
+
+update_bundle() {
+  local from="${MLOPS_DIR}/${RUNTIME_SUBPATH}"
+  [[ -d "${from}" ]] || c_die "no mlops checkout at ${MLOPS_DIR}"
+  mkdir -p "${BUNDLE_DIR}"
+  local f
+  for f in "${RUNTIME_FILES[@]}"; do
+    [[ -f "${from}/${f}" ]] || c_die "${from}/${f} is missing"
+    cp "${from}/${f}" "${BUNDLE_DIR}/${f}"
+  done
+  local commit subject
+  commit="$(git -C "${MLOPS_DIR}" rev-parse HEAD 2>/dev/null || echo unknown)"
+  subject="$(git -C "${MLOPS_DIR}" log -1 --format=%s 2>/dev/null || echo unknown)"
+  # Rewrite only the provenance lines so the prose above them stays editable.
+  if [[ -f "${BUNDLE_DIR}/SOURCE" ]]; then
+    sed -i -e "s|^copied-from: .*|copied-from: ${commit}|" \
+           -e "s|^copied-subject: .*|copied-subject: ${subject}|" \
+           -e "s|^copied-at: .*|copied-at: $(date -Iseconds)|" \
+           "${BUNDLE_DIR}/SOURCE"
+  fi
+  c_ok "bundle refreshed from ${MLOPS_DIR} (${commit:0:12})"
+}
 
 #: The public sample. A single file, no registration, stable release URL.
 SAMPLE_URL="https://github.com/isl-org/open3d_downloads/releases/download/20220201-data/fragment.ply"
@@ -160,14 +204,49 @@ stage_env() {
   c_log "stage env"
   local rc=0
 
-  [[ -d "${MLOPS_DIR}" ]] || { c_fail "  no mlops checkout at ${MLOPS_DIR}"; return 1; }
-  RUNTIME_SRC="${MLOPS_DIR}/src/geo_mlops/resources/training_runtime"
-  for f in pointcept_semseg.py pointcept_pyfunc.py annotations.py; do
+  local checkout="${MLOPS_DIR}/${RUNTIME_SUBPATH}"
+  local origin=""
+  if [[ -d "${checkout}" ]]; then
+    RUNTIME_SRC="${checkout}"
+    origin="mlops checkout ${MLOPS_DIR}"
+  elif [[ "${MLOPS_EXPLICIT}" == "1" ]]; then
+    # Asked for by name and not there: falling back would verify something
+    # other than what was asked for.
+    c_fail "  no mlops checkout at ${MLOPS_DIR}"
+    c_fail "  drop --mlops to use the vendored copy in ${BUNDLE_DIR}"
+    return 1
+  else
+    RUNTIME_SRC="${BUNDLE_DIR}"
+    origin="vendored copy"
+  fi
+
+  local f
+  for f in "${RUNTIME_FILES[@]}"; do
     if [[ ! -f "${RUNTIME_SRC}/${f}" ]]; then
       c_fail "  ${RUNTIME_SRC}/${f} is missing"; rc=1
     fi
   done
-  [[ "${rc}" == "0" ]] && c_ok "  mlops entrypoints at ${RUNTIME_SRC}"
+  [[ "${rc}" == "0" ]] || return 1
+  c_ok "  entrypoints from ${origin}"
+
+  if [[ "${RUNTIME_SRC}" == "${BUNDLE_DIR}" ]]; then
+    # The copy says where it came from; a run that verifies a months-old
+    # trainer should say so out loud rather than pass quietly.
+    local stamp
+    stamp="$(sed -n 's/^copied-from: //p' "${BUNDLE_DIR}/SOURCE" 2>/dev/null || true)"
+    [[ -n "${stamp}" ]] && c_ok "    copied from mlops ${stamp:0:12}"
+  else
+    # Both present: say whether the vendored copy still matches, because the
+    # next machine will run that one instead.
+    local drifted=()
+    for f in "${RUNTIME_FILES[@]}"; do
+      cmp -s "${RUNTIME_SRC}/${f}" "${BUNDLE_DIR}/${f}" || drifted+=("${f}")
+    done
+    if [[ "${#drifted[@]}" -gt 0 ]]; then
+      c_warn "  vendored copy is stale: ${drifted[*]}"
+      c_warn "  refresh with: ${SCRIPT_NAME} --mlops ${MLOPS_DIR} --update-bundle"
+    fi
+  fi
 
   if [[ -z "${UV_BIN}" ]]; then
     c_warn "  uv not found; falling back to python -m venv / pip"
@@ -486,7 +565,12 @@ APP_DIR="${WORK_DIR}/app"
 MLFLOW_URI="sqlite:///${WORK_DIR}/mlflow.db"
 MLFLOW_ARTIFACTS="${WORK_DIR}/artifacts"
 
-c_log "${SCRIPT_NAME}: ${REPO_ROOT} against ${MLOPS_DIR}"
+if [[ "${UPDATE_BUNDLE}" == "1" ]]; then
+  update_bundle
+  exit 0
+fi
+
+c_log "${SCRIPT_NAME}: ${REPO_ROOT}"
 
 # Unlike verify_wheels.sh, which checks independent things and keeps going,
 # each stage here feeds the next: after a failed install every later report is

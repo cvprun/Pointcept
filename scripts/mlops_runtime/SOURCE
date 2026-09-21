@@ -1,0 +1,16 @@
+These three files are copies, not sources. They belong to the mlops platform:
+
+    src/geo_mlops/resources/training_runtime/
+
+They are vendored here so verify_mlops.sh can run on a machine that has no
+mlops checkout -- the GPU nodes worth testing on are exactly the ones that do
+not carry the platform's source. verify_mlops.sh prefers a real checkout
+whenever it finds one and warns when this copy has drifted from it.
+
+Do not edit them here. Edit them in mlops and refresh:
+
+    ./scripts/verify_mlops.sh --mlops /path/to/mlops --update-bundle
+
+copied-from: a4386900094930799fd8c6767809a6e3ee94bf85
+copied-subject: feat(pointcept): Let a run pin spconv to Native
+copied-at: 2026-09-21T11:05:20+09:00
