@@ -63,7 +63,10 @@ NATIVE_CACHE_DIR="${PC_NATIVE_CACHE:-${NATIVE_CACHE_DIR:+${NATIVE_CACHE_DIR}/poi
 # ------------------------------------------------------------------------------
 # Defaults
 # ------------------------------------------------------------------------------
-DEFAULT_OS="ubuntu24.04"
+# manylinux_2_28 is not a distribution but a promise about the wheels: built on
+# glibc 2.28 with gcc-toolset, then checked and tagged by auditwheel, they load
+# on any Linux as old as the torch wheels themselves (see manylinux_repair).
+DEFAULT_OS="manylinux_2_28"
 DEFAULT_TORCH="2.9.1"
 DEFAULT_PYTHON="3.12"
 
@@ -168,13 +171,18 @@ version_ge() {
   [[ "$(printf '%s\n%s\n' "${a}" "${b}" | sort -V | head -1)" == "${b}" ]]
 }
 
-# CUDA releases before 12.6 never shipped an ubuntu24.04 devel image.
+# CUDA releases before 12.6 never shipped an ubuntu24.04 devel image. Every
+# toolkit here has a rockylinux8 one, which is what manylinux_2_28 builds on.
 cuda_supported_os() {
   case "$1" in
-    cu118|cu121|cu124) echo "ubuntu22.04" ;;
-    *)                 echo "ubuntu24.04 ubuntu22.04" ;;
+    cu118|cu121|cu124) echo "manylinux_2_28 ubuntu22.04" ;;
+    *)                 echo "manylinux_2_28 ubuntu24.04 ubuntu22.04" ;;
   esac
 }
+
+KNOWN_OS=" manylinux_2_28 ubuntu24.04 ubuntu22.04 "
+
+is_manylinux() { [[ "$1" == manylinux_* ]]; }
 
 accel_kind() {
   case "$1" in
@@ -192,7 +200,13 @@ base_image_for() {
     cuda)
       local full; full="$(cuda_full_version "${accel}")" \
         || die "unsupported CUDA token '${accel}' (known: ${KNOWN_CUDA_ACCELS[*]})"
-      echo "nvidia/cuda:${full}-devel-${os}"
+      # Rocky Linux 8 is glibc 2.28 -- the same floor as manylinux_2_28, and
+      # nvidia publishes devel images for it on both amd64 and arm64.
+      if is_manylinux "${os}"; then
+        echo "nvidia/cuda:${full}-devel-rockylinux8"
+      else
+        echo "nvidia/cuda:${full}-devel-${os}"
+      fi
       ;;
     rocm)
       # rocm/dev-ubuntu-<ver>:<rocm>-complete carries the full HIP toolchain.
@@ -200,7 +214,7 @@ base_image_for() {
       echo "rocm/dev-ubuntu-${os#ubuntu}:${ver}-complete"
       ;;
     cpu)
-      echo "ubuntu:${os#ubuntu}"
+      if is_manylinux "${os}"; then echo "rockylinux:8"; else echo "ubuntu:${os#ubuntu}"; fi
       ;;
   esac
 }
@@ -339,7 +353,8 @@ ${C_BOLD}COMMANDS${C_RESET}
   help               Show this message
 
 ${C_BOLD}MATRIX AXES${C_RESET} (comma separated; the cartesian product is built)
-  --os        LIST   ubuntu24.04, ubuntu22.04            [${DEFAULT_OS}]
+  --os        LIST   manylinux_2_28, ubuntu24.04,
+                     ubuntu22.04                         [${DEFAULT_OS}]
   --arch      LIST   amd64, arm64                        [this machine]
   --accel     LIST   cu118 cu121 cu124 cu126 cu128 cu129
                      cu130 cu131 cu132 rocm6.3 rocm6.4
@@ -440,6 +455,14 @@ ${C_BOLD}NOTES${C_RESET}
     appended to rather than rewritten. 'clean' drops both.
   * Wheels land in <out>/linux-<arch>/<accel>/torch<ver>-cp<py>/ with a
     manifest.txt recording how each wheel was obtained.
+  * The default --os manylinux_2_28 builds on Rocky Linux 8 (glibc 2.28) with
+    gcc-toolset, then runs every platform wheel through 'auditwheel repair'. The
+    wheels come out tagged manylinux_2_28_<arch> and load on any Linux that can
+    run torch itself; one that would need a newer glibc or libstdc++ fails the
+    build instead of the user's import. torch, CUDA and libgomp are excluded
+    from the repair -- torch and its nvidia-* wheels already provide them.
+    ROCm has no such image, so without an explicit --os it builds on
+    ubuntu24.04. --native builds are never retagged.
   * 'build' first prints the same preview as 'matrix' (combinations, packages,
     output directory) and asks for confirmation before any container starts.
     Pass -y/--yes to skip the question; a non-interactive stdin (CI, cron)
@@ -472,6 +495,8 @@ EOF
 
 # Matrix axes
 OS_LIST=""; ARCH_LIST=""; ACCEL_LIST=""; TORCH_LIST=""; PYTHON_LIST=""
+# 1 when --os was not given, so the default may bend where it has no image.
+OS_DEFAULTED=0
 PRESET=""
 ONLY=""; SKIP=""
 FORCE_SOURCE="0"
@@ -573,7 +598,7 @@ apply_preset() {
     native_resolve_toolkit || true
   fi
 
-  : "${OS_LIST:=${DEFAULT_OS}}"
+  if [[ -z "${OS_LIST}" ]]; then OS_LIST="${DEFAULT_OS}"; OS_DEFAULTED=1; fi
   : "${TORCH_LIST:=${DEFAULT_TORCH}}"
   : "${PYTHON_LIST:=${DEFAULT_PYTHON}}"
   [[ -n "${PRESET}" ]] || resolve_host_target
@@ -775,11 +800,20 @@ expand_matrix() {
       for accel in $(split_list "${ACCEL_LIST}"); do
         for torch in $(split_list "${TORCH_LIST}"); do
           for python in $(split_list "${PYTHON_LIST}"); do
+            # ROCm publishes Ubuntu images only. A default the user never asked
+            # for should not turn an AMD build into an empty matrix, so there it
+            # falls back to Ubuntu; an explicit --os manylinux_2_28 still skips.
+            local target_os="${os}"
+            if [[ "${OS_DEFAULTED}" == "1" ]] && is_manylinux "${os}" \
+               && [[ "$(accel_kind "${accel}" 2>/dev/null)" == "rocm" ]]; then
+              target_os="ubuntu24.04"
+              warn_once "rocm-os" "${accel}: ROCm has no ${os} base image; building on ${target_os} (wheels are not manylinux-tagged)"
+            fi
             # An if, not `validate && echo`: when the last combination fails
             # validation that list's status becomes the function's, and the
             # caller's `combos="$(expand_matrix)"` trips errexit without a word.
-            if validate_combo "${os}" "${arch}" "${accel}" "${torch}" "${python}"; then
-              echo "${os}|${arch}|${accel}|${torch}|${python}"
+            if validate_combo "${target_os}" "${arch}" "${accel}" "${torch}" "${python}"; then
+              echo "${target_os}|${arch}|${accel}|${torch}|${python}"
             fi
           done
         done
@@ -878,6 +912,17 @@ validate_combo() {
   case "${arch}" in amd64|arm64) ;; *) warn "skip: unknown arch '${arch}'"; return 1 ;; esac
 
   kind="$(accel_kind "${accel}")" || { warn "skip: unknown accelerator '${accel}'"; return 1; }
+
+  # A native build labels the venv with the host's own OS, which is not one of
+  # the images this script knows.
+  if [[ "${NATIVE}" != "1" && "${KNOWN_OS}" != *" ${os} "* ]]; then
+    warn_once "os-${os}" "skip: unknown --os '${os}' (known:${KNOWN_OS% })"
+    return 1
+  fi
+  if [[ "${kind}" == "rocm" ]] && is_manylinux "${os}"; then
+    warn_once "rocm-${os}" "skip: ROCm has no ${os} base image (use --os ubuntu24.04)"
+    return 1
+  fi
 
   if [[ "${kind}" == "cuda" ]]; then
     cuda_full_version "${accel}" >/dev/null \
@@ -1786,6 +1831,17 @@ cmd_image() {
     local ctx; ctx="$(mktemp -d)"
 
     cp -r "${wheels}"/*.whl "${ctx}/"
+    local sys_install
+    if is_manylinux "${os}"; then
+      sys_install='dnf install -y --setopt=install_weak_deps=False \
+      ca-certificates curl git libgomp openblas tmux vim-minimal \
+ && dnf clean all'
+    else
+      sys_install='apt-get update \
+ && apt-get install -y --no-install-recommends \
+      ca-certificates curl git libgomp1 libopenblas0 tmux vim \
+ && rm -rf /var/lib/apt/lists/*'
+    fi
     cat > "${ctx}/Dockerfile" <<EOF
 FROM ${base}
 
@@ -1793,10 +1849,7 @@ ENV DEBIAN_FRONTEND=noninteractive \\
     PYTHONUNBUFFERED=1 \\
     PATH=/opt/venv/bin:\$PATH
 
-RUN apt-get update \\
- && apt-get install -y --no-install-recommends \\
-      ca-certificates curl git libgomp1 libopenblas0 tmux vim \\
- && rm -rf /var/lib/apt/lists/*
+RUN ${sys_install}
 
 COPY *.whl /wheels/
 
@@ -1916,7 +1969,60 @@ container_init_cache() {
   export UV_PYTHON_INSTALL_DIR=/cache/python
 }
 
+# gcc-toolset release for nvcc on Rocky Linux 8. Each CUDA release caps the host
+# gcc it accepts (11.8 stops at 11, 12.1 at 12), and torch's headers need 9+.
+gcc_toolset_for() {
+  case "$1" in
+    cu118) echo "11" ;;
+    cu121) echo "12" ;;
+    *)     echo "13" ;;
+  esac
+}
+
+# The manylinux_2_28 toolchain: Rocky Linux 8 with a gcc-toolset compiler. The
+# toolset is what keeps the wheels portable -- its libstdc++ links every symbol
+# newer than the system's GCC 8 statically (libstdc++_nonshared.a), so the
+# extensions still ask the host only for GLIBCXX 3.4.25 and glibc 2.28.
+container_prepare_system_dnf() {
+  local quiet="-q"; [[ "${PC_VERBOSE}" == "1" ]] && quiet=""
+  local redirect="/dev/null"; [[ "${PC_VERBOSE}" == "1" ]] && redirect="/dev/stderr"
+  local toolset; toolset="$(gcc_toolset_for "${PC_ACCEL}")"
+
+  local -a dnf_opts=(-y --setopt=install_weak_deps=False)
+  if [[ -n "${CACHE_ROOT}" ]]; then
+    mkdir -p "${CACHE_ROOT}/dnf"
+    dnf_opts+=(--setopt=keepcache=1 "--setopt=cachedir=${CACHE_ROOT}/dnf")
+  fi
+
+  # sparsehash-devel lives in EPEL, openblas-devel in PowerTools.
+  dnf "${dnf_opts[@]}" ${quiet} install dnf-plugins-core epel-release > "${redirect}" 2>&1 \
+    || die "dnf could not install epel-release"
+  dnf config-manager --set-enabled powertools > "${redirect}" 2>&1 \
+    || die "dnf could not enable the powertools repository"
+  dnf "${dnf_opts[@]}" ${quiet} install \
+    "gcc-toolset-${toolset}-gcc" "gcc-toolset-${toolset}-gcc-c++" \
+    make cmake git curl ca-certificates which \
+    openblas-devel sparsehash-devel pkgconf-pkg-config \
+    > "${redirect}" 2>&1 \
+    || die "dnf could not install the gcc-toolset-${toolset} toolchain"
+
+  # `enable` only edits PATH and friends; sourced here, it holds for every
+  # compile this process starts. set -u is suspended because the script reads
+  # variables it expects may be unset.
+  set +u
+  # shellcheck disable=SC1090
+  source "/opt/rh/gcc-toolset-${toolset}/enable"
+  set -u
+  export CC=gcc CXX=g++
+  c_ok "system toolchain ready (gcc-toolset-${toolset}, g++ $(g++ -dumpfullversion))"
+}
+
 container_prepare_system() {
+  if is_manylinux "${PC_OS}"; then
+    c_log "installing system toolchain (${PC_OS}: Rocky Linux 8, gcc-toolset)"
+    container_prepare_system_dnf
+    return
+  fi
   c_log "installing system toolchain"
   export DEBIAN_FRONTEND=noninteractive
   local quiet="-qq"; [[ "${PC_VERBOSE}" == "1" ]] && quiet=""
@@ -2069,6 +2175,61 @@ prune_stale_wheels() {
   done
 }
 
+# Libraries a repaired wheel must not carry. torch ships libtorch/libc10 and its
+# own libgomp, the nvidia-* wheels torch depends on ship the CUDA runtime and
+# friends, and libcuda comes from the driver. A second copy of any of them
+# inside a wheel would load beside the one torch already has.
+MANYLINUX_EXCLUDES=(
+  'libtorch*' 'libc10*' 'libshm*' 'libcaffe2*' 'libgomp*'
+  'libcuda.so*' 'libcudart*' 'libnvrtc*' 'libcublas*' 'libcusparse*'
+  'libcurand*' 'libcufft*' 'libcusolver*' 'libnvJitLink*' 'libnvToolsExt*'
+  'libcudnn*' 'libnccl*' 'libcupti*' 'libnvshmem*'
+)
+
+# Retag every platform wheel in `dir` as manylinux, in place.
+#
+# `auditwheel repair` is the check as much as the fix: it refuses a wheel that
+# needs a newer glibc or libstdc++ than the policy allows, which is exactly the
+# failure that otherwise only shows up as an ImportError on the user's host.
+# Pure-python and already-manylinux wheels pass through untouched.
+manylinux_repair() {
+  local dir="$1"
+  is_manylinux "${PC_OS}" || return 0
+
+  if ! "${PY}" -m auditwheel --version >/dev/null 2>&1; then
+    uv pip install --python "${PY}" auditwheel patchelf >/dev/null 2>&1 \
+      || { c_warn "could not install auditwheel"; return 1; }
+  fi
+
+  local plat="${PC_OS}_$(uname -m)"
+  local -a excl=()
+  local e
+  for e in "${MANYLINUX_EXCLUDES[@]}"; do excl+=(--exclude "${e}"); done
+
+  local torch_lib
+  torch_lib="$("${PY}" -c 'import os, torch; print(os.path.join(os.path.dirname(torch.__file__), "lib"))')"
+
+  local whl out
+  for whl in "${dir}"/*.whl; do
+    [[ "$(basename "${whl}")" == *-linux_*.whl ]] || continue
+    out="$(mktemp -d)"
+    # torch's own directory has to be on the search path: auditwheel resolves
+    # every NEEDED entry before it decides what to exclude.
+    if ! LD_LIBRARY_PATH="${torch_lib}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" \
+         "${PY}" -m auditwheel repair --plat "${plat}" "${excl[@]}" -w "${out}" "${whl}" \
+         > "${STAGE_WORK}/auditwheel.log" 2>&1; then
+      c_warn "auditwheel cannot make $(basename "${whl}") ${plat}:"
+      tail -15 "${STAGE_WORK}/auditwheel.log" >&2
+      rm -rf "${out}"
+      return 1
+    fi
+    rm -f "${whl}"
+    mv "${out}"/*.whl "${dir}/"
+    rm -rf "${out}"
+  done
+  return 0
+}
+
 # Try to fetch a prebuilt wheel for the current interpreter/platform. Returns 0
 # and drops the wheel into /out when one exists, 1 when the package has to be
 # compiled. This is the check that makes amd64 fast and arm64 correct.
@@ -2090,6 +2251,14 @@ try_prebuilt() {
   "${args[@]}" >/dev/null 2>&1
   rc=$?
   set -e
+
+  # A prebuilt tagged plain linux_* (PyG's are) promises nothing about glibc.
+  # Under manylinux it has to pass the same repair as a compiled wheel, and one
+  # that cannot is compiled here instead.
+  if [[ ${rc} -eq 0 ]] && compgen -G "${tmp}/*.whl" >/dev/null && ! manylinux_repair "${tmp}"; then
+    c_warn "prebuilt ${spec} is not ${PC_OS}-compatible; compiling it instead"
+    rc=1
+  fi
 
   if [[ ${rc} -eq 0 ]] && compgen -G "${tmp}/*.whl" >/dev/null; then
     local name; name="$(basename "$(ls "${tmp}"/*.whl | head -1)")"
@@ -2239,6 +2408,11 @@ build_wheel() {
   if ! compgen -G "${stage}/*.whl" >/dev/null; then
     rm -rf "${stage}"
     c_warn "${label}: pip reported success but produced no wheel"
+    return 1
+  fi
+
+  if ! manylinux_repair "${stage}"; then
+    rm -rf "${stage}"
     return 1
   fi
 
