@@ -13,8 +13,9 @@
 #     build_wheels.sh compiles them as the newest arch they know plus PTX. On
 #     sm_121 (DGX Spark) or sm_110 (Thor) the driver JIT-compiles that PTX on
 #     the first kernel launch -- and only then can it fail;
-#   * flash-attn has no kernels for those parts at all and is skipped, so the
-#     models that want it must still run through their fallback path.
+#   * flash-attn ships cubins for sm_80/90/100/120 only. sm_121 (DGX Spark)
+#     rides on sm_120 PTX the same way, while sm_110 (Thor) has nothing to
+#     reach and is skipped -- models that want it then run their fallback path.
 #
 # So the stages below go all the way to a real forward pass rather than
 # stopping at `import`. Every stage keeps going after a failure and the summary
@@ -157,9 +158,10 @@ ${C_BOLD}STAGES${C_RESET}
   model     build PTv3 and run a forward pass on synthetic points
 
 ${C_BOLD}NOTES${C_RESET}
-  * flash-attn is optional: on sm_121 / sm_110 it has no kernels and
-    build_wheels.sh skips it, which the model stage compensates for by
-    disabling flash attention. Its absence is not a failure.
+  * flash-attn is optional: on sm_121 it is built as sm_120 PTX, but on
+    sm_110 and Turing it has no kernels and build_wheels.sh skips it, which
+    the model stage compensates for by disabling flash attention. Its absence
+    is not a failure.
   * The venv is created and populated with uv when it is on PATH, the same
     front-end build_wheels.sh uses, so the two share a wheel cache. Without uv
     the script falls back to 'python -m venv' and pip; --no-uv forces that.
@@ -406,7 +408,7 @@ stage_import() {
   for entry in "${MODULE_TABLE[@]}"; do
     IFS='|' read -r dist mod required <<<"${entry}"
     # A wheel that is not in this directory was never built for this target --
-    # flash-attn on sm_121, or a partial `build --only` run. Importing it would
+    # flash-attn on sm_110, or a partial `build --only` run. Importing it would
     # test whatever else is installed on the machine, so skip and say so.
     if [[ -n "${WHEELHOUSE:-}" ]]; then
       shopt -s nullglob
