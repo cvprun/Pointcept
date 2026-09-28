@@ -2130,10 +2130,29 @@ container_install_torch() {
     c_ok "torch ${have} already provisioned"
   else
     c_log "installing torch==${PC_TORCH} from ${PC_TORCH_INDEX}"
-    uv pip install --python "${PY}" \
-      --index-url "${PC_TORCH_INDEX}" \
-      "torch==${PC_TORCH}" \
-      || die "torch ${PC_TORCH} is not available for ${PC_ACCEL}/${PC_ARCH} on CPython ${PC_PYTHON}"
+    # torch drags in several gigabytes of CUDA wheels, some from pypi.nvidia.com,
+    # and a single stalled download fails the whole install. uv's default 30s
+    # read timeout is too tight for that, and whatever did land stays in
+    # UV_CACHE_DIR, so a retry only fetches what is still missing. Only a
+    # resolver failure means the release really does not exist for this target.
+    local attempt out rc
+    for attempt in 1 2 3; do
+      out="$(UV_HTTP_TIMEOUT="${UV_HTTP_TIMEOUT:-300}" uv pip install --python "${PY}" \
+        --index-url "${PC_TORCH_INDEX}" \
+        "torch==${PC_TORCH}" 2>&1)" && rc=0 || rc=$?
+      echo "${out}" >&2
+      if [[ ${rc} -eq 0 ]]; then
+        break
+      fi
+      if grep -qE "No solution found|not found in the package registry" <<<"${out}"; then
+        die "torch ${PC_TORCH} is not available for ${PC_ACCEL}/${PC_ARCH} on CPython ${PC_PYTHON}"
+      fi
+      if [[ ${attempt} -lt 3 ]]; then
+        c_warn "torch install failed (attempt ${attempt}/3), retrying"
+      fi
+    done
+    [[ ${rc} -eq 0 ]] \
+      || die "torch ${PC_TORCH} install failed after 3 attempts (network?); see the uv output above"
   fi
 
   # setup.py of every native package imports torch, so the build front-end needs
