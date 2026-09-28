@@ -10,6 +10,7 @@ data
 *log*
 outputs/
 wheelhouse/
+wheelhouse-wide/
 .vscode
 .idea
 */.DS_Store
