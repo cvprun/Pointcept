@@ -27,7 +27,7 @@ set -euo pipefail
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 REPO_ROOT="$(cd "$(dirname "${SCRIPT_PATH}")/.." && pwd)"
 BUILDER="${REPO_ROOT}/scripts/build_wheels.sh"
-OUT="${REPO_ROOT}/wheelhouse-wide"
+OUT="${REPO_ROOT}/wheelhouse"
 
 for spec in "cu126|8.0 8.6 8.9 9.0" \
             "cu128|8.0 8.6 8.9 9.0 10.0 12.0" \

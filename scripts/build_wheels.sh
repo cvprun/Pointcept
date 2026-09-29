@@ -385,6 +385,7 @@ ${C_BOLD}PACKAGE SELECTION${C_RESET}
   --list-packages    Print known package names and exit
                      (pccm, ocnn and torch-geometric are not built: they
                      come from PyPI, see requirements-pypi.txt)
+  --list-pypi        Print requirements-pypi.txt and exit
   --force-source     Compile from source even if a prebuilt wheel exists
   --prefer-prebuilt  Reuse prebuilt wheels when available          [default]
 
@@ -554,6 +555,7 @@ parse_args() {
       --only)          ONLY="$2";                 shift 2 ;;
       --skip)          SKIP="$2";                 shift 2 ;;
       --list-packages) printf '%s\n' "${ALL_PACKAGES[@]}"; exit 0 ;;
+      --list-pypi)     printf '%s\n' "${PYPI_REQUIREMENTS[@]}"; exit 0 ;;
       --force-source)  FORCE_SOURCE="1";          shift   ;;
       --prefer-prebuilt) FORCE_SOURCE="0";        shift   ;;
       --cuda-arch)     CUDA_ARCH_OVERRIDE="$2";   shift 2 ;;

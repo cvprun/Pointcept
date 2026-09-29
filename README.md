@@ -368,6 +368,18 @@ If you find _Pointcept_ useful to your research, please cite our work as encoura
   or fold them into a runnable image with `./scripts/build_wheels.sh image --preset default`. A directory
   built before this split still holds those three wheels; the next `build` into it removes them.
 
+  `./scripts/release_wheels.sh` publishes each wheelhouse directory as its own GitHub Release, tagged
+  with the Pointcept version it was built from (`v1.7.0-linux-amd64-cu128-torch2.9.1-cp312`) — one per
+  directory because the CUDA lines share wheel filenames. `--build` runs this host's
+  `build_matrix_<arch>.sh` first; a directory whose last build recorded a failure is not published, and
+  re-running replaces a release's assets rather than adding to them. The wheels are not GPU-verified.
+
+  ```bash
+  ./scripts/release_wheels.sh --build            # on the amd64 box, then again on the DGX Spark
+  T=v1.7.0-linux-amd64-cu128-torch2.9.1-cp312
+  pip install --find-links https://github.com/cvprun/Pointcept/releases/expanded_assets/$T spconv-cu128 pointops
+  ```
+
   Cross-architecture builds run under QEMU after a one-time `./scripts/build_wheels.sh setup-qemu`.
   QEMU-emulated `nvcc` is 10-30x slower than native, so for a full arm64 matrix point the script at a real
   aarch64 machine instead: `--docker-host ssh://your-arm-box`. That runs entirely on the remote daemon, so
