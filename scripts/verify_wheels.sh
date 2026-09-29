@@ -45,16 +45,20 @@ REPO_ROOT="$(cd "$(dirname "${SCRIPT_PATH}")/.." && pwd)"
 # passing test, so the table is explicit rather than derived.
 #
 # Format: <wheel dist prefix>|<import name>|<required?>
+#
+# required=pypi marks the pure python packages build_wheels.sh leaves out of the
+# wheelhouse: they come from PyPI through requirements-pypi.txt, so there is no
+# wheel to look for, only an import that has to work.
 # ------------------------------------------------------------------------------
 MODULE_TABLE=(
-  "pccm|pccm|yes"
+  "pccm|pccm|pypi"
   "cumm|cumm|yes"
   "spconv|spconv.pytorch|yes"
   "torch_scatter|torch_scatter|yes"
   "torch_sparse|torch_sparse|yes"
   "torch_cluster|torch_cluster|yes"
-  "torch_geometric|torch_geometric|yes"
-  "ocnn|ocnn|yes"
+  "torch_geometric|torch_geometric|pypi"
+  "ocnn|ocnn|pypi"
   "swin3d|Swin3D.sparse_dl.knn|yes"
   "pointops|pointops|yes"
   "pointops2|pointops2.pointops|yes"
@@ -246,6 +250,11 @@ if [[ "${IN_PLACE}" == "0" || -n "${WHEELHOUSE}" ]]; then
   WHEELS=("${WHEELHOUSE}"/*.whl)
   shopt -u nullglob
   [[ ${#WHEELS[@]} -gt 0 ]] || c_die "no wheels in ${WHEELHOUSE}"
+  # The pure python half, installed from PyPI (see build_wheels.sh). A
+  # wheelhouse built before that split carries those wheels itself instead.
+  PYPI_REQS=()
+  [[ ! -f "${WHEELHOUSE}/requirements-pypi.txt" ]] \
+    || PYPI_REQS=(-r "${WHEELHOUSE}/requirements-pypi.txt")
 fi
 
 # The accel token is the second-to-last path component (…/cu130/torch2.9.1-cp312).
@@ -379,8 +388,9 @@ stage_install() {
   before="$("${PY}" -c 'import torch; print(torch.__version__)' 2>/dev/null || true)"
 
   # One pip call for every wheel: they depend on each other (spconv needs cumm
-  # needs pccm) and resolving them together keeps pip from reaching for PyPI.
-  py_install --quiet "${WHEELS[@]}" || return 1
+  # needs pccm) and resolving them together with the PyPI requirements keeps
+  # pip from picking a PyPI copy of anything the wheelhouse provides.
+  py_install --quiet "${WHEELS[@]}" ${PYPI_REQS[@]+"${PYPI_REQS[@]}"} || return 1
   py_install --quiet "${RUNTIME_DEPS[@]}" || return 1
 
   # peft and transformers carry their own torch specifiers, and pip may satisfy
@@ -410,7 +420,7 @@ stage_import() {
     # A wheel that is not in this directory was never built for this target --
     # flash-attn on sm_110, or a partial `build --only` run. Importing it would
     # test whatever else is installed on the machine, so skip and say so.
-    if [[ -n "${WHEELHOUSE:-}" ]]; then
+    if [[ -n "${WHEELHOUSE:-}" && "${required}" != "pypi" ]]; then
       shopt -s nullglob
       local present=("${WHEELHOUSE}/${dist}"-*.whl "${WHEELHOUSE}/${dist}"_*.whl)
       shopt -u nullglob
@@ -602,9 +612,9 @@ def t_torch_geometric():
     from torch_geometric.nn.pool import voxel_grid
 
     # torch-geometric 2.8 moved grid_cluster from torch-cluster to pyg-lib, and
-    # pyg-lib publishes no aarch64 wheel; build_wheels.sh holds torch-geometric
-    # below 2.8 for that reason. An ImportError naming pyg-lib here means the
-    # wheelhouse predates that pin.
+    # pyg-lib publishes no aarch64 wheel; build_wheels.sh pins torch-geometric
+    # below 2.8 in requirements-pypi.txt for that reason. An ImportError naming
+    # pyg-lib here means that pin was not applied.
     cluster = voxel_grid(xyz, size=0.1, batch=torch.zeros(N, dtype=torch.long, device=dev))
     assert cluster.numel() == N
 
@@ -630,7 +640,7 @@ CHECKS = {
     "Swin3D": t_swin3d,
 }
 
-# ocnn and torch_geometric ship as py3-none-any: there is no compiled artifact
+# ocnn and torch_geometric are py3-none-any from PyPI: there is no compiled artifact
 # of their own to launch, so importing them (the stage above) is the whole
 # check. torch_geometric still appears here because voxel_grid calls into
 # torch_cluster, which is compiled.

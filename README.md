@@ -332,8 +332,8 @@ If you find _Pointcept_ useful to your research, please cite our work as encoura
 
   A full matrix compiled natively on a slow machine can run for the better part of a day, so the build is
   splittable: `--only <packages>` restricts one invocation to part of the set, and everything accumulates
-  into the same output directory. Dependencies come along automatically — `--only spconv` builds `pccm`
-  and `cumm` first, because both are imported by spconv's own `setup.py`. cumm is uninstalled from the
+  into the same output directory. Dependencies come along automatically — `--only spconv` builds `cumm`
+  first, because spconv's own `setup.py` imports it (and cumm's imports `pccm`, which comes from PyPI). cumm is uninstalled from the
   cached venv immediately before it is rebuilt: its `setup.py` *appends* its own source directory to
   `sys.path` rather than prepending it, so a copy left installed by an earlier run shadows the tree pip
   just cloned, and pccm then emits every binding a namespace level too deep — a wheel that compiles and
@@ -342,7 +342,7 @@ If you find _Pointcept_ useful to your research, please cite our work as encoura
   ```bash
   # One target, one package per sitting; resume whenever you like
   T="--arch arm64 --accel cu130 --torch 2.9.1 --cuda-arch 12.1"   # DGX Spark (sm_121)
-  ./scripts/build_wheels.sh build $T --only spconv                # pccm + cumm + spconv
+  ./scripts/build_wheels.sh build $T --only spconv                # cumm + spconv
   ./scripts/build_wheels.sh build $T --only torch-sparse
   ./scripts/build_wheels.sh build $T --only pointops,pointops2,pointrope
   ```
@@ -356,8 +356,17 @@ If you find _Pointcept_ useful to your research, please cite our work as encoura
 
   Wheels land in `wheelhouse/linux-<arch>/<accel>/torch<ver>-cp<py>/`, each directory carrying a
   `manifest.txt` that records whether a wheel was downloaded or compiled, appended to once per run.
-  Install them with `pip install wheelhouse/linux-*/cu128/torch2.9.1-cp312/*.whl`, or fold them into a
-  runnable image with `./scripts/build_wheels.sh image --preset default`.
+  The pure python dependencies — `pccm`, `ocnn` and `torch-geometric` — are published on PyPI as
+  `py3-none-any` and are neither built nor copied there; each directory lists them, with the
+  `torch-geometric<2.8` pin, in `requirements-pypi.txt` instead. Install both halves together:
+
+  ```bash
+  W=wheelhouse/linux-amd64/cu128/torch2.9.1-cp312
+  pip install $W/*.whl -r $W/requirements-pypi.txt
+  ```
+
+  or fold them into a runnable image with `./scripts/build_wheels.sh image --preset default`. A directory
+  built before this split still holds those three wheels; the next `build` into it removes them.
 
   Cross-architecture builds run under QEMU after a one-time `./scripts/build_wheels.sh setup-qemu`.
   QEMU-emulated `nvcc` is 10-30x slower than native, so for a full arm64 matrix point the script at a real

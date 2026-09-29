@@ -72,14 +72,30 @@ DEFAULT_PYTHON="3.12"
 
 # Every package this script knows how to produce, in dependency order.
 ALL_PACKAGES=(
-  pccm cumm spconv
-  torch-scatter torch-sparse torch-cluster torch-geometric
-  flash-attn ocnn swin3d
+  cumm spconv
+  torch-scatter torch-sparse torch-cluster
+  flash-attn swin3d
   pointops pointops2 pointgroup_ops pointseg pointrope
 )
 
-# Packages that are pure python (no compilation, arch independent).
-PURE_PYTHON_PACKAGES=" pccm torch-geometric ocnn "
+# torch-geometric 2.8 moved grid_cluster out of torch-cluster and into pyg-lib:
+# `voxel_grid` now raises ImportError unless pyg_lib.ops exposes it (see
+# WITH_GRID_CLUSTER in torch_geometric/typing.py). Pointcept calls voxel_grid
+# from PTv2, OACNNs, StratifiedTransformer and MaskedSceneContrast, so 2.8 takes
+# those models out -- and pyg-lib cannot fill the gap here: it is not on PyPI at
+# all, only on data.pyg.org, which publishes linux_x86_64 and win_amd64 and
+# nothing for aarch64. Staying below 2.8 keeps voxel_grid on the torch-cluster
+# this script already builds for every target. Raise it once pyg-lib ships arm64
+# wheels, or once Pointcept stops calling voxel_grid.
+PYG_MAX="${PC_PYG_MAX:-2.8}"
+
+# Pure python dependencies, published on PyPI as py3-none-any. They are neither
+# built nor copied into the wheelhouse: a copy would be the same file PyPI
+# serves to every target. Each wheelhouse gets them as requirements-pypi.txt
+# instead, to install alongside its wheels (pip install *.whl -r ...).
+PYPI_PACKAGES=(pccm ocnn torch-geometric)
+PYPI_REQUIREMENTS=(pccm ocnn "torch-geometric<${PYG_MAX}")
+PYPI_REQUIREMENTS_FILE="requirements-pypi.txt"
 
 # Packages that live in this repository under libs/.
 LOCAL_PACKAGES=" pointops pointops2 pointgroup_ops pointseg pointrope "
@@ -367,6 +383,8 @@ ${C_BOLD}PACKAGE SELECTION${C_RESET}
   --only      LIST   Build only these packages
   --skip      LIST   Skip these packages
   --list-packages    Print known package names and exit
+                     (pccm, ocnn and torch-geometric are not built: they
+                     come from PyPI, see requirements-pypi.txt)
   --force-source     Compile from source even if a prebuilt wheel exists
   --prefer-prebuilt  Reuse prebuilt wheels when available          [default]
 
@@ -435,7 +453,7 @@ ${C_BOLD}EXAMPLES${C_RESET}
   # One package per sitting on a slow box: same target, resumable, accumulating
   # into the same directory. The toolchain and torch are provisioned once.
   T="--arch arm64 --accel cu130 --torch 2.9.1 --cuda-arch 12.1"   # DGX Spark
-  ${SCRIPT_NAME} build \${T} --only spconv        # pulls in pccm + cumm
+  ${SCRIPT_NAME} build \${T} --only spconv        # pulls in cumm
   ${SCRIPT_NAME} build \${T} --only torch-sparse
 
 ${C_BOLD}NOTES${C_RESET}
@@ -758,6 +776,8 @@ selected_packages() {
 
   if [[ -n "${ONLY}" ]]; then
     for pkg in $(split_list "${ONLY}"); do
+      [[ " ${PYPI_PACKAGES[*]} " == *" ${pkg} "* ]] \
+        && die "'${pkg}' is installed from PyPI, not built (see ${PYPI_REQUIREMENTS_FILE})"
       [[ " ${ALL_PACKAGES[*]} " == *" ${pkg} "* ]] \
         || die "unknown package '${pkg}' (see --list-packages)"
     done
@@ -773,13 +793,10 @@ selected_packages() {
     chosen+=("${pkg}")
   done
 
-  # spconv cannot be compiled without cumm, and cumm needs pccm. Pull the
-  # dependencies in silently rather than failing halfway through the build.
+  # spconv cannot be compiled without cumm. Pull it in silently rather than
+  # failing halfway through the build. (cumm's own pccm comes from PyPI.)
   if [[ " ${chosen[*]} " == *" spconv "* ]]; then
     [[ " ${chosen[*]} " == *" cumm "* ]] || chosen=(cumm "${chosen[@]}")
-  fi
-  if [[ " ${chosen[*]} " == *" cumm "* ]]; then
-    [[ " ${chosen[*]} " == *" pccm "* ]] || chosen=(pccm "${chosen[@]}")
   fi
 
   printf '%s\n' "${chosen[@]}"
@@ -1149,10 +1166,11 @@ print_plan() {
   local pkg
   for pkg in "${pkgs[@]}"; do
     local note=""
-    [[ "${PURE_PYTHON_PACKAGES}" == *" ${pkg} "* ]] && note="pure python"
-    [[ "${LOCAL_PACKAGES}"       == *" ${pkg} "* ]] && note="local (libs/${pkg})"
+    [[ "${LOCAL_PACKAGES}" == *" ${pkg} "* ]] && note="local (libs/${pkg})"
     printf '  %-16s %s\n' "${pkg}" "${C_DIM}${note}${C_RESET}"
   done
+  echo "${C_BOLD}From PyPI${C_RESET} (not built; ${PYPI_REQUIREMENTS_FILE})"
+  printf '  %s\n' "${PYPI_REQUIREMENTS[@]}"
 
   echo
   [[ -z "${CUDA_ARCH_OVERRIDE}" ]] || echo "${C_BOLD}CUDA archs${C_RESET} ${CUDA_ARCH_OVERRIDE}"
@@ -1831,6 +1849,7 @@ cmd_image() {
     local ctx; ctx="$(mktemp -d)"
 
     cp -r "${wheels}"/*.whl "${ctx}/"
+    printf '%s\n' "${PYPI_REQUIREMENTS[@]}" > "${ctx}/${PYPI_REQUIREMENTS_FILE}"
     local sys_install
     if is_manylinux "${os}"; then
       sys_install='dnf install -y --setopt=install_weak_deps=False \
@@ -1851,7 +1870,7 @@ ENV DEBIAN_FRONTEND=noninteractive \\
 
 RUN ${sys_install}
 
-COPY *.whl /wheels/
+COPY *.whl ${PYPI_REQUIREMENTS_FILE} /wheels/
 
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh \\
  && /root/.local/bin/uv venv --python ${python} /opt/venv \\
@@ -1859,6 +1878,7 @@ RUN curl -LsSf https://astral.sh/uv/install.sh | sh \\
       --index-url $(torch_index_url "$(torch_index_accel "${accel}")") \\
       torch==${torch} torchvision \\
  && /root/.local/bin/uv pip install --python /opt/venv/bin/python /wheels/*.whl \\
+      -r /wheels/${PYPI_REQUIREMENTS_FILE} \\
  && /root/.local/bin/uv pip install --python /opt/venv/bin/python \\
       h5py pyyaml tensorboard tensorboardx wandb yapf addict einops scipy \\
       plyfile termcolor timm ftfy regex tqdm matplotlib numpy peft \\
@@ -2500,11 +2520,6 @@ pyg_find_links() {
   echo "https://data.pyg.org/whl/torch-${t}+${a}.html"
 }
 
-pkg_pccm() {
-  try_prebuilt "pccm" && return 0
-  build_wheel "pccm" "pccm"
-}
-
 # spconv 2.x and its cumm backend are CUDA-only; there is no HIP path.
 spconv_family_supported() {
   case "${PC_ACCEL}" in
@@ -2747,23 +2762,6 @@ pkg_torch_scatter() { pkg_pyg_ext "torch-scatter" "rusty1s/pytorch_scatter"; }
 pkg_torch_sparse()  { pkg_pyg_ext "torch-sparse"  "rusty1s/pytorch_sparse";  }
 pkg_torch_cluster() { pkg_pyg_ext "torch-cluster" "rusty1s/pytorch_cluster"; }
 
-# torch-geometric 2.8 moved grid_cluster out of torch-cluster and into pyg-lib:
-# `voxel_grid` now raises ImportError unless pyg_lib.ops exposes it (see
-# WITH_GRID_CLUSTER in torch_geometric/typing.py). Pointcept calls voxel_grid
-# from PTv2, OACNNs, StratifiedTransformer and MaskedSceneContrast, so 2.8 takes
-# those models out -- and pyg-lib cannot fill the gap here: it is not on PyPI at
-# all, only on data.pyg.org, which publishes linux_x86_64 and win_amd64 and
-# nothing for aarch64. Staying below 2.8 keeps voxel_grid on the torch-cluster
-# this script already builds for every target. Raise it once pyg-lib ships arm64
-# wheels, or once Pointcept stops calling voxel_grid.
-PYG_MAX="${PC_PYG_MAX:-2.8}"
-
-pkg_torch_geometric() {
-  local spec="torch-geometric<${PYG_MAX}"
-  try_prebuilt "${spec}" && return 0
-  build_wheel "torch-geometric" "${spec}"
-}
-
 # flash-attn 2.x ships kernels for exactly four targets -- sm_80, sm_90, sm_100
 # and sm_120 -- and picks them from its own FLASH_ATTN_CUDA_ARCHS variable, not
 # from TORCH_CUDA_ARCH_LIST. Left alone it compiles all four no matter what
@@ -2865,11 +2863,6 @@ pkg_flash_attn() {
     ${extra[*]+"${extra[@]}"}
 }
 
-pkg_ocnn() {
-  try_prebuilt "ocnn" && return 0
-  build_wheel "ocnn" "git+https://github.com/octree-nn/ocnn-pytorch.git"
-}
-
 # microsoft/Swin3D is a single commit from June 2023 and does not compile against
 # a current PyTorch: its AT_DISPATCH_* calls pass tensor.type(), whose
 # at::DeprecatedTypeProperties overload has been removed, and it includes
@@ -2915,6 +2908,23 @@ pkg_local() {
   build_wheel "${name}" "${work}"
 }
 
+# The PyPI half of the wheelhouse (see PYPI_PACKAGES). Written on every run, so
+# a directory built before these packages left the matrix also loses the
+# py3-none-any copies it still carries: installing those beside the requirements
+# would let a stale pin win.
+write_pypi_requirements() {
+  printf '%s\n' "${PYPI_REQUIREMENTS[@]}" > "${STAGE_OUT}/${PYPI_REQUIREMENTS_FILE}"
+  local pkg old
+  for pkg in "${PYPI_PACKAGES[@]}"; do
+    for old in "${STAGE_OUT}/${pkg//-/_}"-*-none-any.whl; do
+      [[ -e "${old}" ]] || continue
+      rm -f "${old}"
+      c_warn "removed $(basename "${old}") (installed from PyPI now)"
+      record "# removed $(basename "${old}")"
+    done
+  done
+}
+
 run_in_container() {
   : "${PC_OS:?}"; : "${PC_ARCH:?}"; : "${PC_ACCEL:?}"
   : "${PC_TORCH:?}"; : "${PC_PYTHON:?}"
@@ -2934,6 +2944,8 @@ run_in_container() {
   record "# $(date -u '+%Y-%m-%d %H:%M:%SZ') build_wheels.sh linux/${PC_ARCH} ${PC_ACCEL} torch${PC_TORCH} cp${PC_PYTHON}"
   record "# cuda arch list: ${TORCH_CUDA_ARCH_LIST:-n/a}  rocm arch: ${PYTORCH_ROCM_ARCH:-n/a}"
   record "# packages: ${PKG_LIST}"
+  record "# from PyPI: ${PYPI_REQUIREMENTS[*]} (${PYPI_REQUIREMENTS_FILE})"
+  write_pypi_requirements
 
   echo "${C_BOLD}target${C_RESET} linux/${PC_ARCH} ${PC_ACCEL} torch${PC_TORCH} cp${PC_PYTHON} jobs=${PC_JOBS}" >&2
   [[ -n "${TORCH_CUDA_ARCH_LIST:-}" ]] && echo "${C_BOLD}archs ${C_RESET} ${TORCH_CUDA_ARCH_LIST}" >&2
@@ -2950,15 +2962,12 @@ run_in_container() {
     echo "${C_BOLD}[${pkg}]${C_RESET}" >&2
     local rc=0
     case "${pkg}" in
-      pccm)            pkg_pccm            || rc=$? ;;
       cumm)            pkg_cumm            || rc=$? ;;
       spconv)          pkg_spconv          || rc=$? ;;
       torch-scatter)   pkg_torch_scatter   || rc=$? ;;
       torch-sparse)    pkg_torch_sparse    || rc=$? ;;
       torch-cluster)   pkg_torch_cluster   || rc=$? ;;
-      torch-geometric) pkg_torch_geometric || rc=$? ;;
       flash-attn)      pkg_flash_attn      || rc=$? ;;
-      ocnn)            pkg_ocnn            || rc=$? ;;
       swin3d)          pkg_swin3d          || rc=$? ;;
       pointops|pointops2|pointgroup_ops|pointseg|pointrope)
                        pkg_local "${pkg}"  || rc=$? ;;
