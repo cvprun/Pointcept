@@ -210,14 +210,44 @@ if [[ "${USE_UV}" == "1" ]]; then
   [[ -z "${UV_BIN}" && -x "${HOME}/.local/bin/uv" ]] && UV_BIN="${HOME}/.local/bin/uv"
 fi
 
+# What a transient download failure looks like in uv's and pip's output.
+NETWORK_ERROR_RE='network timeout|UV_HTTP_TIMEOUT|Failed to (download|fetch)|error sending request|timed out|connection (reset|refused|closed|aborted)|Temporary failure in name resolution|ReadTimeoutError|ConnectionResetError|IncompleteRead|ProtocolError'
+
 # Install into ${PY} whichever front-end we have. Every flag used at the call
 # sites -- --quiet, --upgrade, --index-url -- means the same thing to both.
 py_install() {
-  if [[ -n "${UV_BIN}" ]]; then
-    "${UV_BIN}" pip install --python "${PY}" "$@"
-  else
-    "${PY}" -m pip install "$@"
-  fi
+  # torch drags in several gigabytes of CUDA wheels, some from pypi.nvidia.com,
+  # and a single stalled download fails the whole install. uv's default 30s
+  # read timeout is too tight for that, and whatever did land stays in the
+  # cache, so a retry only fetches what is still missing. Only a failure that
+  # reads like the network is retried: a wheel that does not resolve or does
+  # not fit this interpreter is a result, and repeating it changes nothing.
+  #
+  # UV_HTTP_TIMEOUT is a read timeout: it counts silence on one stream, not the
+  # length of the download. uv opens up to 50 streams at once, and on a link
+  # that cannot feed them all some get nothing until they time out, so a longer
+  # timeout only waits longer on a stream that is already starved. A retry
+  # narrows the fan-out instead, unless the caller chose one.
+  local attempt out rc
+  local -a fanout=("" 4 1) uv_env
+  for attempt in 1 2 3; do
+    if [[ -n "${UV_BIN}" ]]; then
+      uv_env=("UV_HTTP_TIMEOUT=${UV_HTTP_TIMEOUT:-300}")
+      if [[ -z "${UV_CONCURRENT_DOWNLOADS:-}" && -n "${fanout[attempt-1]}" ]]; then
+        uv_env+=("UV_CONCURRENT_DOWNLOADS=${fanout[attempt-1]}")
+      fi
+      out="$(env "${uv_env[@]}" \
+        "${UV_BIN}" pip install --python "${PY}" "$@" 2>&1)" && rc=0 || rc=$?
+    else
+      out="$("${PY}" -m pip install "$@" 2>&1)" && rc=0 || rc=$?
+    fi
+    [[ -n "${out}" ]] && echo "${out}" >&2
+    [[ ${rc} -eq 0 ]] && return 0
+    grep -qiE "${NETWORK_ERROR_RE}" <<<"${out}" || return "${rc}"
+    [[ ${attempt} -lt 3 ]] \
+      && c_warn "install failed on the network (attempt ${attempt}/3), retrying with fewer parallel downloads"
+  done
+  return "${rc}"
 }
 
 # ------------------------------------------------------------------------------
