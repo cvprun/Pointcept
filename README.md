@@ -368,9 +368,10 @@ If you find _Pointcept_ useful to your research, please cite our work as encoura
   or fold them into a runnable image with `./scripts/build_wheels.sh image --preset default`. A directory
   built before this split still holds those three wheels; the next `build` into it removes them.
 
-  Pointcept itself ships as a wheel too. `./scripts/build_pointcept_wheel.sh` packages a commit's
-  `pointcept/` and `configs/` as `pointcept-1.7.0.post<N>+g<sha>-py3-none-any.whl` — pure python, so
-  one file serves every directory — with the configs moved inside the package
+  Pointcept itself ships as a wheel too. `./scripts/build_pointcept_wheel.sh` packages `pointcept/` and
+  `configs/` as `pointcept-1.7.0.post<N>+g<sha>-py3-none-any.whl`, named after the commit that last
+  changed them, so every host builds the same file from any later commit. It is pure python, so one
+  file serves every directory, amd64 and arm64 alike, with the configs moved inside the package
   (`<site-packages>/pointcept/configs/scannet/...`, where `_base_` still resolves). It declares no
   dependencies: install it together with the wheels above. The `build_matrix_<arch>.sh` scripts put it
   into every wheelhouse directory, and `verify_wheels.sh` then tests that installed copy, configs

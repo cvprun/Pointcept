@@ -40,18 +40,25 @@
 # Requires-Dist here would let a resolver pull a torch of its own while
 # installing the wheelhouse.
 #
-# Built from a commit, not the working tree, through `git archive`. The version
-# names that commit:
+# Built from a commit, not the working tree, through `git archive` -- from the
+# commit that last changed the packaged files at or before --ref, which is also
+# the commit the version names:
 #
-#   1.7.0.post12+g92f4d68      12 commits past v1.7.0, at 92f4d68
+#   1.7.0.post8+g9f37497       9f37497 last changed pointcept/ or configs/;
+#                              it is 8 commits past v1.7.0
 #
-# The base is the newest plain v* tag the commit contains, this repository's or
+# A commit that touches only scripts/ or libs/ therefore rebuilds the very same
+# wheel. That matters because each host releases from its own checkout -- the
+# amd64 box and the DGX Spark rarely sit on one commit -- and the six releases
+# must still carry one source under one name.
+#
+# The base is the newest plain v* tag that commit contains, this repository's or
 # else upstream's (the fork carries none of its own), or --version; .postN
-# orders builds and the local label tells two of them apart. Every commit gets its own filename,
-# which matters because release_wheels.sh skips an asset whose name and size a
-# release already holds, and installers cache by filename. The build is
-# reproducible -- a pinned backend, stamped with the commit time -- so one
-# commit built twice gives the same bytes.
+# orders builds and the local label tells two of them apart. Every change to the
+# packaged files gets its own filename, which matters because release_wheels.sh
+# skips an asset whose name and size a release already holds, and installers
+# cache by filename. The build is reproducible -- a pinned backend, stamped with
+# the commit time -- so the same files give the same bytes on any host.
 #
 # Quick start
 #   ./scripts/build_pointcept_wheel.sh                      # dist/pointcept-*.whl from HEAD
@@ -126,7 +133,13 @@ done
 git_() { git -C "${REPO_ROOT}" "$@"; }
 
 git_ rev-parse --git-dir >/dev/null 2>&1 || die "${REPO_ROOT} is not a git checkout"
-COMMIT="$(git_ rev-parse --verify -q "${REF}^{commit}")" || die "not a commit: ${REF}"
+REF_COMMIT="$(git_ rev-parse --verify -q "${REF}^{commit}")" || die "not a commit: ${REF}"
+
+# What the wheel is made of, and the commit it is built from and named after:
+# the last one to change those files (see the header).
+PACKAGED=(pointcept configs LICENSE)
+COMMIT="$(git_ rev-list -1 "${REF_COMMIT}" -- "${PACKAGED[@]}")"
+[[ -n "${COMMIT}" ]] || die "no commit at or before ${REF} has ${PACKAGED[*]}"
 SHORT="$(git_ rev-parse --short=7 "${COMMIT}")"
 
 if [[ -n "${VERSION}" ]]; then
@@ -187,8 +200,10 @@ WHEEL_VERSION+="+g${SHORT}"
 WHEEL_NAME="pointcept-${WHEEL_VERSION}-py3-none-any.whl"
 
 log "${C_BOLD}${WHEEL_NAME}${C_RESET} from ${COMMIT}"
-if [[ "${COMMIT}" == "$(git_ rev-parse HEAD)" \
-      && -n "$(git_ status --porcelain -- pointcept configs LICENSE)" ]]; then
+[[ "${COMMIT}" == "${REF_COMMIT}" ]] \
+  || log "  the last change to ${PACKAGED[*]} at or before $(git_ rev-parse --short=7 "${REF_COMMIT}")"
+if [[ "${REF_COMMIT}" == "$(git_ rev-parse HEAD)" \
+      && -n "$(git_ status --porcelain -- "${PACKAGED[@]}")" ]]; then
   warn "uncommitted changes under pointcept/ or configs/ are not in the wheel; it is built from ${SHORT}"
 fi
 
@@ -212,7 +227,7 @@ trap 'rm -rf "${STAGE}"' EXIT
 SRC="${STAGE}/src"
 mkdir -p "${SRC}"
 
-git_ archive --format=tar "${COMMIT}" pointcept configs LICENSE | tar -x -C "${SRC}"
+git_ archive --format=tar "${COMMIT}" "${PACKAGED[@]}" | tar -x -C "${SRC}"
 [[ ! -e "${SRC}/pointcept/configs" ]] \
   || die "pointcept/configs already exists at ${SHORT}; configs/ has nowhere to go"
 mv "${SRC}/configs" "${SRC}/pointcept/configs"
