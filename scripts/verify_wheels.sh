@@ -81,7 +81,10 @@ MODULE_TABLE=(
 # torchvision belongs to the same closure (utonia) and is deliberately absent:
 # it is compiled against one specific libtorch, so it is installed next to torch
 # from the same index in stage_install rather than resolved from PyPI here.
-RUNTIME_DEPS=(addict einops timm numpy packaging peft scipy transformers wandb)
+#
+# The pointcept stage reads every config, which adds the config loader's yapf
+# and, through the ScanNet200 configs' class list, pointcept.datasets' h5py.
+RUNTIME_DEPS=(addict einops timm numpy packaging peft scipy transformers wandb yapf h5py)
 
 # ------------------------------------------------------------------------------
 # Logging
@@ -145,7 +148,7 @@ ${C_BOLD}OPTIONS${C_RESET}
   --torch-index URL  pip index for torch (default: derived from the accel in
                      the wheelhouse path -- cu130, rocm6.4 and cpu each map
                      straight onto download.pytorch.org/whl/<accel>).
-  --quick            Stop after the import stage; skip kernels and the model.
+  --quick            Skip the kernel and model stages.
   --python BIN       Interpreter used to create the venv (default: python3).
                      With uv this may also be a bare version -- '3.12' -- which
                      uv downloads if the host has no such interpreter.
@@ -158,6 +161,8 @@ ${C_BOLD}STAGES${C_RESET}
   tags      wheel filename tags against this interpreter and platform
   install   install torch + every wheel into a fresh venv (uv, else pip)
   import    import each module by the name Pointcept actually uses
+  pointcept the installed pointcept wheel, if any: where it imports from, and
+            every config in it loads
   kernel    run one real op per native package (forces cubin/PTX to load)
   model     build PTv3 and run a forward pass on synthetic points
 
@@ -485,6 +490,75 @@ stage_import() {
 }
 
 # ------------------------------------------------------------------------------
+# Stage: pointcept
+#
+# Pointcept itself. A wheelhouse that carries the pointcept wheel
+# (build_pointcept_wheel.sh) has just installed it, and that copy is what its
+# consumers run -- so it is what this stage and the model stage import, from a
+# directory where this checkout cannot shadow it: `python -` puts the working
+# directory first on sys.path. Every config in it is read too. Configs are
+# loaded by path, so a wheel that lost a `_base_` file, or the module the
+# ScanNet200 configs import their class list from, imports cleanly and fails
+# only here. Without the wheel the model stage imports this checkout.
+# ------------------------------------------------------------------------------
+MODEL_CWD="${REPO_ROOT}"
+# Whether `import pointcept` lands in the installed distribution -- not merely
+# whether it succeeds, which a checkout on PYTHONPATH (--in-place) also does.
+POINTCEPT_PROBE='
+import importlib.metadata, os, pointcept
+dist = importlib.metadata.distribution("pointcept")
+assert os.path.realpath(pointcept.__file__) \
+    == os.path.realpath(dist.locate_file("pointcept/__init__.py"))
+'
+stage_pointcept() {
+  c_log "stage pointcept: the installed source and its configs"
+  if ! ( cd "${NEUTRAL_DIR}" && "${PY}" -c "${POINTCEPT_PROBE}" >/dev/null 2>&1 ); then
+    c_skip "pointcept does not import from an installed wheel; the model stage imports ${REPO_ROOT}"
+    return 0
+  fi
+  MODEL_CWD="${NEUTRAL_DIR}"
+  ( cd "${NEUTRAL_DIR}" && "${PY}" - <<'PYEOF'
+import importlib.metadata
+import os
+import sys
+import types
+
+# pointcept.datasets imports open3d unguarded and nothing here touches it; the
+# ScanNet200 configs reach that package for their class list.
+sys.modules.setdefault("open3d", types.ModuleType("open3d"))
+
+import pointcept  # noqa: E402
+from pointcept.utils.config import Config  # noqa: E402
+
+root = os.path.dirname(pointcept.__file__)
+print(f"  pointcept    {importlib.metadata.version('pointcept')}  {root}")
+configs = os.path.join(root, "configs")
+if not os.path.isdir(configs):
+    print("  FAIL no configs/ inside the package")
+    raise SystemExit(1)
+
+# _base_ holds fragments the others inherit; they are read through those.
+paths = sorted(
+    os.path.join(d, f)
+    for d, _, files in os.walk(configs)
+    if os.path.basename(d) != "_base_"
+    for f in files
+    if f.endswith(".py")
+)
+failed = 0
+for path in paths:
+    try:
+        Config.fromfile(path)
+    except Exception as e:  # noqa: BLE001 -- any of them is a broken config
+        failed += 1
+        print(f"  FAIL {os.path.relpath(path, configs)}: {type(e).__name__}: {e}")
+print(f"  configs      {len(paths) - failed}/{len(paths)} load")
+raise SystemExit(1 if failed else 0)
+PYEOF
+  )
+}
+
+# ------------------------------------------------------------------------------
 # Stage: kernel
 #
 # One real op per native package, on the GPU. This is the stage that catches a
@@ -751,7 +825,7 @@ PYEOF
 # ------------------------------------------------------------------------------
 stage_model() {
   c_log "stage model: PTv3 forward on synthetic points"
-  ( cd "${REPO_ROOT}" && "${PY}" - <<'PYEOF'
+  ( cd "${MODEL_CWD}" && "${PY}" - <<'PYEOF'
 import torch
 
 if not torch.cuda.is_available():
@@ -808,10 +882,14 @@ PYEOF
 # Environment setup
 # ------------------------------------------------------------------------------
 CLEANUP_VENV=""
+# An empty working directory, so that `python -` imports the installed
+# pointcept rather than a pointcept/ it happens to be standing in.
+NEUTRAL_DIR="$(mktemp -d -t pointcept-cwd-XXXXXX)"
 cleanup() {
   if [[ -n "${CLEANUP_VENV}" && "${KEEP_VENV}" == "0" ]]; then
     rm -rf "${CLEANUP_VENV}"
   fi
+  rm -rf "${NEUTRAL_DIR}"
 }
 trap cleanup EXIT
 
@@ -897,6 +975,7 @@ fi
 
 stage_env && rc=0 || rc=1; stage_result env "${rc}"
 stage_import && rc=0 || rc=1; stage_result import "${rc}"
+stage_pointcept && rc=0 || rc=1; stage_result pointcept "${rc}"
 
 if [[ "${QUICK}" == "0" ]]; then
   stage_kernel && rc=0 || rc=1; stage_result kernel "${rc}"

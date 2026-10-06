@@ -15,6 +15,12 @@
 #
 #   pip install --find-links https://github.com/<repo>/releases/expanded_assets/<tag> ...
 #
+# Each release also carries Pointcept itself, the pure python wheel
+# build_pointcept_wheel.sh makes (pointcept-1.7.0.post<N>+g<sha>-py3-none-any),
+# so one --find-links installs the source together with its kernels. It is
+# built here from the commit the tags point at and put into every directory
+# before they are mirrored, so a release holds the source its tag names.
+#
 # With --build the host's matrix (build_matrix_<arch>.sh) runs first. Nothing
 # is verified: the free GitHub runners have no GPU, so this runs on the build
 # host and uploads what it built.
@@ -184,7 +190,7 @@ write_notes() {
   run="$(last_run "${dir}/manifest.txt" 2>/dev/null || true)"
   archs="$(sed -n 's/^# cuda arch list: \([^ ]*\( [^ ]*\)*\)  rocm arch:.*/\1/p' <<<"${run}" | tail -1)"
   {
-    echo "Prebuilt native dependencies for **Pointcept ${VERSION}**."
+    echo "**Pointcept ${VERSION}** as a pure python wheel, with its native dependencies prebuilt."
     echo
     echo "| | |"
     echo "|---|---|"
@@ -198,7 +204,7 @@ write_notes() {
     echo
     echo '```bash'
     echo "pip install --find-links https://github.com/${REPO}/releases/expanded_assets/${tag} \\"
-    echo "  spconv-${accel} torch-scatter torch-sparse torch-cluster pointops pointops2 \\"
+    echo "  pointcept spconv-${accel} torch-scatter torch-sparse torch-cluster pointops pointops2 \\"
     echo "  pointgroup_ops pointseg pointrope swin3d flash-attn"
     echo "pip install -r https://github.com/${REPO}/releases/download/${tag}/requirements-pypi.txt"
     echo '```'
@@ -304,6 +310,17 @@ publish_dir() {
 
 log "repo ${REPO}  version ${VERSION}  target ${TARGET:0:7}  root ${ROOT}"
 [[ "${DRY_RUN}" == "0" ]] || log "dry run: nothing is created or uploaded"
+
+# Pointcept itself, from TARGET. --into swaps out whatever older pointcept wheel
+# a directory holds (a matrix build leaves one from the commit it ran at), and
+# the mirroring below then drops that one from the release as well.
+PC_OUT="$(mktemp -d -t pointcept-release-XXXXXX)"
+trap 'rm -rf "${PC_OUT}"' EXIT
+PC_ARGS=(--ref "${TARGET}" --version "${VERSION}" --out "${PC_OUT}")
+[[ "${DRY_RUN}" == "1" ]] || PC_ARGS+=(--into "${ROOT}")
+PC_WHEEL="$(bash "${REPO_ROOT}/scripts/build_pointcept_wheel.sh" "${PC_ARGS[@]}")" \
+  || die "could not build the pointcept wheel"
+[[ "${DRY_RUN}" == "0" ]] || log "would put $(basename "${PC_WHEEL}") into every directory"
 
 failed=()
 for dir in "${DIRS[@]}"; do

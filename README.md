@@ -368,16 +368,30 @@ If you find _Pointcept_ useful to your research, please cite our work as encoura
   or fold them into a runnable image with `./scripts/build_wheels.sh image --preset default`. A directory
   built before this split still holds those three wheels; the next `build` into it removes them.
 
+  Pointcept itself ships as a wheel too. `./scripts/build_pointcept_wheel.sh` packages a commit's
+  `pointcept/` and `configs/` as `pointcept-1.7.0.post<N>+g<sha>-py3-none-any.whl` — pure python, so
+  one file serves every directory — with the configs moved inside the package
+  (`<site-packages>/pointcept/configs/scannet/...`, where `_base_` still resolves). It declares no
+  dependencies: install it together with the wheels above. The `build_matrix_<arch>.sh` scripts put it
+  into every wheelhouse directory, and `verify_wheels.sh` then tests that installed copy, configs
+  included, instead of this checkout.
+
+  ```bash
+  ./scripts/build_pointcept_wheel.sh                      # dist/pointcept-*.whl from HEAD
+  ./scripts/build_pointcept_wheel.sh --into wheelhouse    # and into every wheelhouse directory
+  ```
+
   `./scripts/release_wheels.sh` publishes each wheelhouse directory as its own GitHub Release, tagged
   with the Pointcept version it was built from (`v1.7.0-linux-amd64-cu128-torch2.9.1-cp312`) — one per
   directory because the CUDA lines share wheel filenames. `--build` runs this host's
   `build_matrix_<arch>.sh` first; a directory whose last build recorded a failure is not published, and
-  re-running replaces a release's assets rather than adding to them. The wheels are not GPU-verified.
+  re-running replaces a release's assets rather than adding to them. Every release also carries the
+  pointcept wheel, built from the commit its tag points at. The wheels are not GPU-verified.
 
   ```bash
   ./scripts/release_wheels.sh --build            # on the amd64 box, then again on the DGX Spark
   T=v1.7.0-linux-amd64-cu128-torch2.9.1-cp312
-  pip install --find-links https://github.com/cvprun/Pointcept/releases/expanded_assets/$T spconv-cu128 pointops
+  pip install --find-links https://github.com/cvprun/Pointcept/releases/expanded_assets/$T pointcept spconv-cu128 pointops
   ```
 
   Cross-architecture builds run under QEMU after a one-time `./scripts/build_wheels.sh setup-qemu`.

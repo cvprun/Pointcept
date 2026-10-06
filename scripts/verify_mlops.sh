@@ -194,6 +194,11 @@ TRAINER_DEPS=(
 #: not use would be reporting on the wrong thing.
 SHIM_DIR=""
 
+#: Where the trainer and the serving path import Pointcept from, put first on
+#: their PYTHONPATH: this checkout, or nothing when the venv has the pointcept
+#: wheel (see locate_pointcept).
+POINTCEPT_SRC="${REPO_ROOT}"
+
 UV_BIN="$(command -v uv || true)"
 PY=""
 
@@ -362,6 +367,30 @@ SHIM
     return 1
   fi
   c_ok "  torch still ${after}"
+  locate_pointcept
+}
+
+# A wheelhouse built by build_pointcept_wheel.sh carries Pointcept itself, and
+# verify_wheels.sh installed it into the venv. That copy is what the platform
+# installs, so it is the one under test: the checkout then stays off PYTHONPATH,
+# and every `python -` runs from WORK_DIR, because sys.path[0] is the working
+# directory there. Without the wheel the checkout is the only Pointcept there is.
+locate_pointcept() {
+  local probe='
+import importlib.metadata, os, pointcept
+dist = importlib.metadata.distribution("pointcept")
+assert os.path.realpath(pointcept.__file__) \
+    == os.path.realpath(dist.locate_file("pointcept/__init__.py"))
+print(dist.version, os.path.dirname(pointcept.__file__))
+'
+  local found
+  if found="$(cd "${WORK_DIR}" && "${PY}" -c "${probe}" 2>/dev/null)"; then
+    POINTCEPT_SRC=""
+    c_ok "  pointcept ${found%% *} from ${found#* }"
+  else
+    POINTCEPT_SRC="${REPO_ROOT}"
+    c_ok "  pointcept from ${REPO_ROOT} (no pointcept wheel installed)"
+  fi
 }
 
 # ------------------------------------------------------------------------------
@@ -502,7 +531,7 @@ PYEOF
   GEO_CONFIG="${WORK_DIR}/experiment.json" \
   MLFLOW_TRACKING_URI="${MLFLOW_URI}" \
   MLFLOW_RUN_ID="${run_id}" \
-  PYTHONPATH="${REPO_ROOT}:${APP_DIR}${SHIM_DIR:+:${SHIM_DIR}}" \
+  PYTHONPATH="${POINTCEPT_SRC:+${POINTCEPT_SRC}:}${APP_DIR}${SHIM_DIR:+:${SHIM_DIR}}" \
     "${PY}" "${APP_DIR}/pointcept_semseg.py" 2>&1 | tee "${WORK_DIR}/train.log"
 
   local rc="${PIPESTATUS[0]}"
@@ -531,7 +560,8 @@ stage_infer() {
   [[ -n "${uri}" ]] || { c_fail "  the trainer logged no model"; return 1; }
   c_ok "  ${uri}"
 
-  PYTHONPATH="${REPO_ROOT}:${APP_DIR}${SHIM_DIR:+:${SHIM_DIR}}" \
+  ( cd "${WORK_DIR}" && \
+  PYTHONPATH="${POINTCEPT_SRC:+${POINTCEPT_SRC}:}${APP_DIR}${SHIM_DIR:+:${SHIM_DIR}}" \
   MLFLOW_TRACKING_URI="${MLFLOW_URI}" \
     "${PY}" - "${uri}" "${DATA_DIR}/scene_00.ply" "${GRID_SIZE}" <<'PYEOF'
 import base64, sys
@@ -567,6 +597,7 @@ assert record.get("ply_b64"), "include_ply was true but no ply came back"
 print(f"   {record['point_count']} points ->", ", ".join(
     f"{c['name']}:{c['ratio']:.3f}" for c in classes))
 PYEOF
+  )
 }
 
 # ------------------------------------------------------------------------------

@@ -39,3 +39,6 @@ for spec in "cu126|8.0 8.6 8.9 9.0" \
     --torch 2.9.1 --python 3.12 --cuda-arch "${spec#*|}" \
     --out "${OUT}" --keep-going -y "$@"
 done
+
+# Pointcept itself: one py3-none-any wheel, the same file in every directory.
+bash "${REPO_ROOT}/scripts/build_pointcept_wheel.sh" --into "${OUT}" >/dev/null
